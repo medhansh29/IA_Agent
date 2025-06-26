@@ -1,0 +1,47 @@
+# STEP 1: Specify the base image
+# We start from a Python image that includes system dependencies for compilation.
+# Python 3.10 is a good stable version. '-slim-buster' is a smaller image.
+FROM python:3.10-slim-buster
+
+# STEP 2: Set environment variables
+# Ensures Python output is sent directly to the terminal, without buffering.
+ENV PYTHONUNBUFFERED 1
+# Set the working directory inside the container
+WORKDIR /app
+
+# STEP 3: Install system dependencies for building certain Python packages (like those needing Rust)
+# 'curl' is needed to download rustup.sh
+# 'build-essential' provides tools like gcc, g++ for compiling C/C++/Rust extensions.
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# STEP 4: Install Rust and Cargo using rustup
+# This is crucial for packages that need to compile Rust code (like some Langchain dependencies).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Add Cargo's bin directory to the PATH for the current and subsequent layers
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# STEP 5: Copy requirements.txt and install Python dependencies
+# We copy requirements.txt separately to leverage Docker's caching.
+# If requirements.txt doesn't change, this layer (and subsequent ones) won't rebuild.
+# '--no-cache-dir' prevents pip from storing downloaded packages, saving image size.
+RUN pip install --no-cache-dir --upgrade pip
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# STEP 6: Copy the rest of your application code into the container
+# The '.' indicates current directory both on host and inside container.
+COPY . .
+
+# STEP 7: Expose the port your FastAPI application will run on
+# Render will automatically map this to an external port.
+EXPOSE $PORT
+
+# STEP 8: Define the command to run your application when the container starts
+# This uses uvicorn to serve your FastAPI application (api_app from api.py).
+# We use $PORT which is an environment variable provided by Render.
+CMD ["uvicorn", "api:api_app", "--host", "0.0.0.0", "--port", "$PORT"]
