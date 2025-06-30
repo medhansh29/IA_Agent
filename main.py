@@ -3,9 +3,10 @@ import uuid # Import uuid for generating project_id
 from langgraph.graph import StateGraph, END
 
 # Import the GraphState and all the node functions from nodes.py
+# Ensure the newly split internal functions are also available for API direct calls
 from nodes import (
     GraphState,
-    generate_variables,
+    generate_variables, # This is the wrapper node for the Langraph graph
     generate_questionnaire,
     modify_variables_llm, # This function will be used for both AV and CV mods
     modify_questionnaire_llm,
@@ -17,7 +18,7 @@ from nodes import (
 workflow = StateGraph(GraphState)
 
 # Add all the defined nodes to the workflow graph
-workflow.add_node("generate_variables_node", generate_variables) # Generates both initial AVs and CVs
+workflow.add_node("generate_variables_node", generate_variables) # Generates both initial AVs and CVs using internal logic
 workflow.add_node("modify_variables_llm_node", modify_variables_llm) # Used for both AV and CV modifications
 workflow.add_node("generate_questionnaire_node", generate_questionnaire)
 workflow.add_node("modify_questionnaire_llm_node", modify_questionnaire_llm)
@@ -65,7 +66,8 @@ app = workflow.compile()
 __all__ = [
     "app", # The compiled full workflow
     "GraphState", # The state definition
-    "generate_variables",
+    # Exporting the granular functions for API direct calls
+    "generate_variables", # The Langraph node wrapper
     "generate_questionnaire",
     "modify_variables_llm",
     "modify_questionnaire_llm",
@@ -99,7 +101,8 @@ if __name__ == "__main__":
         "computational_variables": None,
         "questionnaire": None,
         "error": None,
-        "project_id": test_project_id # Pass the generated project_id
+        "project_id": test_project_id, # Pass the generated project_id
+        "modification_history": [] # Add the required field as an empty list
     }
 
     try:
@@ -123,4 +126,3 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"\nAn unexpected error occurred during workflow execution: {e}")
-

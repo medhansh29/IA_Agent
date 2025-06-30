@@ -20,7 +20,7 @@ from prompts import (
 )
 
 # Import schemas from the new schemas.py file
-from schemas import (
+from schemas.schemas import (
     GraphState,
     VariableSchema,
     AssessmentVariablesOutput,
@@ -32,7 +32,9 @@ from schemas import (
     QuestionnaireModificationsOutput,
     RemediationOutput,
     StringOutput
+    
 )
+from rag_implementation import get_rag_chain_and_retriever
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -42,8 +44,15 @@ SUPABASE_API_KEY = os.getenv("SUPABASE_CLIENT_ANON_KEY", "YOUR_SUPABASE_CLIENT_A
 
 
 # Initialize the Language Model
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
+# Initialize RAG components once at module level
+try:
+    rag_chain, retriever = get_rag_chain_and_retriever()
+except Exception as e:
+    print(f"Warning: Could not initialize RAG components: {e}")
+    rag_chain = None
+    retriever = None
 
 # Helper for refining JS expressions with retry mechanism
 def _refine_js_expression(llm_instance: ChatOpenAI, expression_type: str, current_expression: Optional[str],
@@ -267,13 +276,28 @@ def generate_variables(state: GraphState) -> GraphState:
     current_assessment_variables = state.get("assessment_variables", [])
     current_computational_variables = state.get("computational_variables", [])
 
+    # Get RAG context
+    context_docs = []
+    if retriever:
+        try:
+            print(f"Retrieving RAG context for prompt: {prompt_text}")
+            context_docs = retriever.invoke(prompt_text)
+            print(f"Retrieved {len(context_docs)} context documents.")
+        except Exception as e:
+            print(f"Warning: Could not retrieve RAG context: {e}")
+            context_docs = []
+
     # Step 1: Identify Assessment Variables using LLM
     if not current_assessment_variables:
         print("Generating Assessment Variables...")
         assessment_chain = ASSESSMENT_VARIABLES_PROMPT | llm.with_structured_output(AssessmentVariablesOutput, method='function_calling')
 
         try:
-            llm_response = assessment_chain.invoke({"prompt": prompt_text})
+            llm_response = assessment_chain.invoke({
+                "user_input": prompt_text,
+                "existing_variables": json.dumps(current_assessment_variables),
+                "context": context_docs # Pass RAG context
+            })
             suggested_assessment_vars = llm_response.get("assessment_variables", [])
 
             for var in suggested_assessment_vars:
@@ -293,12 +317,25 @@ def generate_variables(state: GraphState) -> GraphState:
         print("\nGenerating Computational Variables...")
         assessment_var_names = ", ".join([v["var_name"] for v in state["assessment_variables"]])
 
+        # Use RAG context for computational variables based on assessment var names
+        comp_context_docs = []
+        if retriever:
+            try:
+                print(f"Retrieving RAG context for computational variables based on: {assessment_var_names}")
+                comp_context_docs = retriever.invoke(assessment_var_names)
+                print(f"Retrieved {len(comp_context_docs)} context documents for computational variables.")
+            except Exception as e:
+                print(f"Warning: Could not retrieve RAG context for computational variables: {e}")
+                comp_context_docs = []
+
         computational_chain = COMPUTATIONAL_VARIABLES_PROMPT | llm.with_structured_output(ComputationalVariablesOutput, method='function_calling')
 
         try:
             llm_response = computational_chain.invoke({
-                "assessment_var_names": assessment_var_names,
-                "prompt": prompt_text
+                "assessment_variables": json.dumps([{"var_name": v["var_name"], "name": v["name"], "type": v["type"]} for v in state["assessment_variables"]]),
+                "existing_computational_variables": json.dumps(current_computational_variables),
+                "user_input": prompt_text,
+                "context": comp_context_docs # Pass RAG context
             })
             suggested_computational_vars = llm_response.get("computational_variables", [])
 
@@ -316,7 +353,189 @@ def generate_variables(state: GraphState) -> GraphState:
 
     return state
 
-# --- Langraph Node 2: generate_questionnaire ---
+def modify_variables_llm(state: GraphState) -> GraphState:
+    """
+    Allows an LLM to modify assessment and computational variables based on a modification prompt.
+    The LLM can add, update, or remove variables.
+    """
+    print("\n---MODIFYING VARIABLES USING LLM---")
+    # Ensure state["error"] is a string at the start of this node
+    state["error"] = state.get("error", "")
+
+    modification_prompt = state.get("modification_prompt")
+    current_assessment_variables = state.get("assessment_variables")
+    if current_assessment_variables is None:
+        current_assessment_variables = []
+    
+    current_computational_variables = state.get("computational_variables")
+    if current_computational_variables is None:
+        current_computational_variables = []
+
+    if not modification_prompt:
+        print("No modification prompt provided. Skipping LLM variable modification.")
+        return state
+
+    print(f"Applying variable modifications based on: '{modification_prompt}'")
+    modification_chain = VARIABLE_MODIFICATIONS_PROMPT | llm.with_structured_output(VariableModificationsOutput, method='function_calling')
+
+    try:
+        llm_response = modification_chain.invoke({
+            "current_assessment_variables": json.dumps(current_assessment_variables, indent=2),
+            "current_computational_variables": json.dumps(current_computational_variables, indent=2),
+            "modification_request": modification_prompt
+        })
+        modifications = llm_response # This is already the VariableModificationsOutput typed dict
+
+        modified_assessment_variables = list(current_assessment_variables)
+        modified_computational_variables = list(current_computational_variables)
+        project_id = state.get("project_id")
+
+        # Apply Assessment Variable Modifications
+        print("\n---Applying Assessment Variable Modifications---")
+        # Removals
+        if modifications.get("removed_assessment_variable_ids"):
+            initial_count = len(modified_assessment_variables)
+            # Filter based on the modified (project_id-prefixed) IDs
+            removed_base_ids = {f_id.split('_', 1)[-1] for f_id in modifications["removed_assessment_variable_ids"]}
+            modified_assessment_variables = [
+                var for var in modified_assessment_variables
+                if var["id"].split('_', 1)[-1] not in removed_base_ids # Compare only the base ID
+            ]
+            print(f"Removed {initial_count - len(modified_assessment_variables)} assessment variables.")
+        
+        # Updates
+        if modifications.get("updated_assessment_variables"):
+            for update_data in modifications["updated_assessment_variables"]:
+                base_id_to_update = update_data["id"] # This ID is expected to be the base ID (e.g., 'av1', not 'project_id_av1')
+                found = False
+                for i, var in enumerate(modified_assessment_variables):
+                    # Compare base ID of existing var with the ID to update
+                    if var["id"].split('_', 1)[-1] == base_id_to_update:
+                        for key, value in update_data.items():
+                            if key != "id": # Don't update the ID itself here, it's used for matching
+                                var[key] = value
+                        # Re-apply defaults just in case, particularly for var_name consistency
+                        _apply_default_variable_properties(var, is_assessment_var=True, project_id=project_id)
+                        modified_assessment_variables[i] = var
+                        print(f"Updated assessment variable: {base_id_to_update} (name: {var.get('name')})")
+                        found = True
+                        break
+                if not found:
+                    print(f"Warning: Assessment variable with base ID '{base_id_to_update}' to update not found.")
+
+        # Additions
+        if modifications.get("added_assessment_variables"):
+            for new_var_data in modifications["added_assessment_variables"]:
+                # Ensure new variable IDs are unique and apply default properties with project_id
+                # Check for existing base_id to avoid duplicates if LLM re-generates something
+                new_base_id = new_var_data.get("id")
+                is_duplicate = False
+                if new_base_id:
+                    # Check against existing *base* IDs
+                    for existing_var in modified_assessment_variables:
+                        if existing_var["id"].split('_', 1)[-1] == new_base_id:
+                            is_duplicate = True
+                            break
+                
+                if not is_duplicate:
+                    _apply_default_variable_properties(new_var_data, is_assessment_var=True, project_id=project_id)
+                    modified_assessment_variables.append(new_var_data)
+                    print(f"Added new assessment variable: {new_var_data.get('name')}")
+                else:
+                    print(f"Warning: Attempted to add duplicate assessment variable with base ID '{new_base_id}'. Skipping.")
+
+        state["assessment_variables"] = modified_assessment_variables
+
+        # Apply Computational Variable Modifications
+        print("\n---Applying Computational Variable Modifications---")
+        # Removals
+        if modifications.get("removed_computational_variable_ids"):
+            initial_count = len(modified_computational_variables)
+            removed_base_ids = {f_id.split('_', 1)[-1] for f_id in modifications["removed_computational_variable_ids"]}
+            modified_computational_variables = [
+                var for var in modified_computational_variables
+                if var["id"].split('_', 1)[-1] not in removed_base_ids # Compare only the base ID
+            ]
+            print(f"Removed {initial_count - len(modified_computational_variables)} computational variables.")
+        
+        # Updates
+        if modifications.get("updated_computational_variables"):
+            for update_data in modifications["updated_computational_variables"]:
+                base_id_to_update = update_data["id"]
+                found = False
+                for i, var in enumerate(modified_computational_variables):
+                    if var["id"].split('_', 1)[-1] == base_id_to_update:
+                        for key, value in update_data.items():
+                            if key != "id":
+                                var[key] = value
+                        _apply_default_variable_properties(var, is_assessment_var=False, project_id=project_id)
+                        modified_computational_variables[i] = var
+                        print(f"Updated computational variable: {base_id_to_update} (name: {var.get('name')})")
+                        found = True
+                        break
+                if not found:
+                    print(f"Warning: Computational variable with base ID '{base_id_to_update}' to update not found.")
+
+        # Additions
+        if modifications.get("added_computational_variables"):
+            for new_var_data in modifications["added_computational_variables"]:
+                new_base_id = new_var_data.get("id")
+                is_duplicate = False
+                if new_base_id:
+                    for existing_var in modified_computational_variables:
+                        if existing_var["id"].split('_', 1)[-1] == new_base_id:
+                            is_duplicate = True
+                            break
+                if not is_duplicate:
+                    _apply_default_variable_properties(new_var_data, is_assessment_var=False, project_id=project_id)
+                    modified_computational_variables.append(new_var_data)
+                    print(f"Added new computational variable: {new_var_data.get('name')}")
+                else:
+                    print(f"Warning: Attempted to add duplicate computational variable with base ID '{new_base_id}'. Skipping.")
+
+        state["computational_variables"] = modified_computational_variables
+
+        # Crucially, after modifications, re-evaluate computational variable formulas
+        # This will ensure that if an AV was removed, CVs dependent on it are flagged or updated.
+        print("\n---Re-evaluating Computational Variable Formulas based on latest AVs---")
+        latest_assessment_var_names = {var["var_name"] for var in state["assessment_variables"]}
+
+        for cv in state["computational_variables"]:
+            # Only attempt to refine if there's an existing formula to work with
+            if cv.get("formula"):
+                refined_formula = _refine_js_expression(
+                    llm_instance=llm,
+                    expression_type="formula",
+                    current_expression=cv["formula"],
+                    context_question_vars=list(latest_assessment_var_names), # Provide latest AVs as context
+                    target_entity_description=f"computational variable '{cv.get('name')}'"
+                )
+                if "// LLM FAILED" in refined_formula or "// LLM FAILED TO RESPOND" in refined_formula:
+                    state["error"] = (state.get("error") or "") + f"ERROR: Computational variable '{cv.get('name')}' has a problematic formula after AV modifications. "
+                cv["formula"] = refined_formula
+            else:
+                 # If no formula, generate a placeholder based on new AVs if relevant
+                print(f"Generating initial formula for computational variable '{cv.get('name')}'...")
+                generated_formula = _refine_js_expression(
+                    llm_instance=llm,
+                    expression_type="formula",
+                    current_expression=None, # Indicate no existing formula
+                    context_question_vars=list(latest_assessment_var_names),
+                    target_entity_description=f"computational variable '{cv.get('name')}'"
+                )
+                if "// LLM FAILED" in generated_formula or "// LLM FAILED TO RESPOND" in generated_formula:
+                    state["error"] = (state.get("error") or "") + f"ERROR: Failed to generate initial formula for computational variable '{cv.get('name')}'. "
+                cv["formula"] = generated_formula
+
+        state["error"] = None # Clear previous error if successful here
+
+    except Exception as e:
+        state["error"] = (state.get("error") or "") + f"ERROR: LLM failed to generate variable modifications: {e}. "
+        print(f"Error during LLM variable modification: {e}")
+
+    return state
+
+# --- Langraph Node 3: generate_questionnaire ---
 def generate_questionnaire(state: GraphState) -> GraphState:
     """
     Generates a survey questionnaire based on the identified assessment variables.
@@ -324,9 +543,11 @@ def generate_questionnaire(state: GraphState) -> GraphState:
     """
     print("\n---GENERATING QUESTIONNAIRE---")
     # Ensure state["error"] is a string at the start of this node
-    state["error"] = state.get("error", "") 
-
+    state["error"] = state.get("error", "")
     assessment_variables = state.get("assessment_variables", [])
+    computational_variables = state.get("computational_variables")
+    if computational_variables is None:
+        computational_variables = []
     prompt_context = state.get("prompt", "")
     project_id = state.get("project_id") # Get project_id from state
 
@@ -343,17 +564,39 @@ def generate_questionnaire(state: GraphState) -> GraphState:
             "name": var["name"],
             "description": var["description"],
             "type": var["type"]
-        }
-        for var in assessment_variables
+        } for var in assessment_variables
     ]
     assessment_vars_json = json.dumps(assessment_vars_info, indent=2)
+
+    computational_vars_info = [
+        {
+            "var_name": var["var_name"],
+            "name": var["name"],
+            "description": var["description"],
+            "type": var["type"]
+        } for var in computational_variables
+    ]
+    computational_vars_json = json.dumps(computational_vars_info, indent=2)
+
+    # Get RAG context for questionnaire generation
+    context_docs = []
+    if retriever:
+        try:
+            print(f"Retrieving RAG context for questionnaire generation based on: {prompt_context}")
+            context_docs = retriever.invoke(prompt_context)
+            print(f"Retrieved {len(context_docs)} context documents for questionnaire.")
+        except Exception as e:
+            print(f"Warning: Could not retrieve RAG context for questionnaire: {e}")
+            context_docs = []
 
     questionnaire_chain = QUESTIONNAIRE_PROMPT | llm.with_structured_output(QuestionnaireOutput, method='function_calling')
 
     try:
         llm_response = questionnaire_chain.invoke({
-            "prompt_context": prompt_context,
-            "assessment_vars_json": assessment_vars_json
+            "user_input": prompt_context,
+            "assessment_variables": assessment_vars_json,
+            "computational_variables": computational_vars_json,
+            "context": context_docs # Pass RAG context
         })
         generated_questionnaire = llm_response
 
@@ -365,8 +608,8 @@ def generate_questionnaire(state: GraphState) -> GraphState:
                 for question in q_list:
                     if question.get('variable_name'):
                         all_existing_q_vars_set.add(question['variable_name'])
-        
-        # Post-processing: Ensure IDs, default values, and intelligent JS
+
+        # Post-processing: Ensure IDs, default values, and intelligent JS for sec_idx, section in enumerate(generated_questionnaire.get("sections", [])):
         for sec_idx, section in enumerate(generated_questionnaire.get("sections", [])):
             section['order'] = section.get('order', sec_idx + 1) # Ensure order
             # Pass the main state dict directly for error tracking
@@ -380,7 +623,6 @@ def generate_questionnaire(state: GraphState) -> GraphState:
                     # Pass the main state dict directly for error tracking
                     _process_question_properties(question, is_core_q_flag, all_existing_q_vars_set, state, project_id=project_id) # Pass project_id
 
-
         state["questionnaire"] = generated_questionnaire
         print("\n---Generated Questionnaire:---")
         print(json.dumps(generated_questionnaire, indent=2))
@@ -388,179 +630,10 @@ def generate_questionnaire(state: GraphState) -> GraphState:
     except Exception as e:
         state["error"] = (state.get("error") or "") + f"Error generating questionnaire: {e}" # Concatenate
         print(f"Error generating questionnaire: {e}")
-        # Do NOT return state here, allow processing to continue to next node
-        return state
 
     return state
 
 
-# --- Langraph Node 3: modify_variables_llm ---
-def modify_variables_llm(state: GraphState) -> GraphState:
-    """
-    Allows an LLM to modify the assessment and computational variables based on a modification prompt.
-    The LLM can add, update, or remove variables.
-    """
-    print("\n---MODIFYING VARIABLES USING LLM---")
-    # Ensure state["error"] is a string at the start of this node
-    state["error"] = state.get("error", "")
-
-    modification_prompt = state.get("modification_prompt")
-    project_id = state.get("project_id") # Get project_id from state
-    current_assessment_variables = state.get("assessment_variables")
-    if current_assessment_variables is None:
-        current_assessment_variables = []
-    current_computational_variables = state.get("computational_variables")
-    if current_computational_variables is None:
-        current_computational_variables = []
-
-    if not modification_prompt:
-        print("No modification prompt provided. Skipping LLM variable modification.")
-        return state
-
-    print(f"Applying variable modifications based on: '{modification_prompt}'")
-
-    modification_chain = VARIABLE_MODIFICATIONS_PROMPT | llm.with_structured_output(VariableModificationsOutput, method='function_calling')
-
-    try:
-        llm_response = modification_chain.invoke({
-            "assessment_vars_json": json.dumps(current_assessment_variables, indent=2),
-            "computational_vars_json": json.dumps(current_computational_variables, indent=2),
-            "modification_prompt": modification_prompt
-        })
-
-        modifications = llm_response
-
-        # Deep copy current lists to avoid modifying in place until all changes are processed
-        modified_assessment_variables = [dict(var) for var in current_assessment_variables]
-        modified_computational_variables = [dict(var) for var in current_computational_variables]
-
-        # Apply Assessment Variable Modifications
-        print("\n---Applying Assessment Variable Modifications---")
-        # Removals
-        if modifications.get("removed_assessment_variable_ids"):
-            initial_count = len(modified_assessment_variables)
-            # Filter based on the modified (project_id-prefixed) IDs
-            modified_assessment_variables = [
-                var for var in modified_assessment_variables
-                if var["id"].split('_', 1)[-1] not in modifications["removed_assessment_variable_ids"] # Compare only the base ID
-            ]
-            print(f"Removed {initial_count - len(modified_assessment_variables)} assessment variables.")
-
-        # Updates
-        if modifications.get("updated_assessment_variables"):
-            for updated_var_data in modifications["updated_assessment_variables"]:
-                # The LLM output for 'id' might be the base ID (e.g., 'customer_loyalty_score'), not the prefixed one.
-                # We need to find the full prefixed ID in our modified_assessment_variables list.
-                base_var_id = updated_var_data.get("id")
-                if base_var_id:
-                    found = False
-                    for i, var in enumerate(modified_assessment_variables):
-                        # Compare the suffix of the stored ID with the base_var_id from LLM
-                        if var.get("id") and var["id"].endswith(f"_{base_var_id}"):
-                            # IMPORTANT: Do not update the 'id' field in the item here as it's already project_id prefixed.
-                            # Just update other fields from updated_var_data.
-                            for key, value in updated_var_data.items():
-                                if key != "id": # Ensure we don't overwrite the project-prefixed ID
-                                    modified_assessment_variables[i][key] = value
-
-                            _apply_default_variable_properties(modified_assessment_variables[i], is_assessment_var=True, project_id=project_id) # Re-apply defaults (might re-prefix if somehow lost)
-                            print(f"Updated assessment variable: {base_var_id} (name: {modified_assessment_variables[i].get('name')})")
-                            found = True
-                            break
-                    if not found:
-                        print(f"Warning: Assessment variable with base ID '{base_var_id}' to update not found.")
-
-        # Additions
-        if modifications.get("added_assessment_variables"):
-            for new_var_data in modifications["added_assessment_variables"]:
-                # Temporarily get base_id if LLM provided one, or generate a new one for uniqueness check
-                temp_base_id = new_var_data.get('id') or str(uuid.uuid4())
-                # Apply defaults and project_id prefix to get the final ID for comparison/storage
-                _apply_default_variable_properties(new_var_data, is_assessment_var=True, project_id=project_id) 
-
-                # Check for duplicate *prefixed* IDs before appending
-                if not any(var['id'] == new_var_data['id'] for var in modified_assessment_variables):
-                    modified_assessment_variables.append(new_var_data)
-                    print(f"Added new assessment variable: {new_var_data.get('name', new_var_data['id'])}")
-                else:
-                    print(f"Warning: Attempted to add assessment variable with duplicate prefixed ID '{new_var_data['id']}'. Skipping.")
-
-
-        state["assessment_variables"] = modified_assessment_variables
-
-        # Apply Computational Variable Modifications
-        print("\n---Applying Computational Variable Modifications---")
-        # Removals
-        if modifications.get("removed_computational_variable_ids"):
-            initial_count = len(modified_computational_variables)
-            # Filter based on the modified (project_id-prefixed) IDs
-            modified_computational_variables = [
-                var for var in modified_computational_variables
-                if var["id"].split('_', 1)[-1] not in modifications["removed_computational_variable_ids"] # Compare only the base ID
-            ]
-            print(f"Removed {initial_count - len(modified_computational_variables)} computational variables.")
-
-        # Updates
-        if modifications.get("updated_computational_variables"):
-            for updated_var_data in modifications["updated_computational_variables"]:
-                base_var_id = updated_var_data.get("id")
-                if base_var_id:
-                    found = False
-                    for i, var in enumerate(modified_computational_variables):
-                        if var.get("id") and var["id"].endswith(f"_{base_var_id}"):
-                            # IMPORTANT: Do not update the 'id' field in the item here.
-                            original_formula_temp = var.get('formula') # Preserve original formula before updating
-                            
-                            for key, value in updated_var_data.items():
-                                if key != "id":
-                                    modified_computational_variables[i][key] = value
-
-                            _apply_default_variable_properties(modified_computational_variables[i], is_assessment_var=False, project_id=project_id) # Re-apply defaults
-                            
-                            # Re-refine formula if needed (using the *updated* item's potential formula or the original temp one)
-                            modified_computational_variables[i]['formula'] = _refine_js_expression(
-                                llm, "formula", modified_computational_variables[i].get('formula') or original_formula_temp, # Use updated formula if present, else original
-                                [av['var_name'] for av in current_assessment_variables],
-                                f"computational variable '{modified_computational_variables[i].get('name')}'"
-                            )
-                            if "// LLM FAILED TO RESPOND" in modified_computational_variables[i]['formula']:
-                                state["error"] = (state.get("error") or "") + f"ERROR: Formula for computational variable '{modified_computational_variables[i].get('name')}' is problematic. " # Concatenate
-                            print(f"Updated computational variable: {base_var_id} (name: {modified_computational_variables[i].get('name')})")
-                            found = True
-                            break
-                    if not found:
-                        print(f"Warning: Computational variable with base ID '{base_var_id}' to update not found.")
-
-        # Additions
-        if modifications.get("added_computational_variables"):
-            for new_var_data in modifications["added_computational_variables"]:
-                original_formula_temp = new_var_data.get('formula')
-                _apply_default_variable_properties(new_var_data, is_assessment_var=False, project_id=project_id)
-                new_var_data['formula'] = _refine_js_expression(
-                    llm, "formula", original_formula_temp,
-                    [av['var_name'] for av in current_assessment_variables],
-                    f"new computational variable '{new_var_data.get('name')}'"
-                )
-                if "// LLM FAILED TO RESPOND" in new_var_data['formula']:
-                    state["error"] = (state.get("error") or "") + f"ERROR: Formula for new computational variable '{new_var_data.get('name')}' is problematic. " # Concatenate
-
-                if not any(var['id'] == new_var_data['id'] for var in modified_computational_variables):
-                    modified_computational_variables.append(new_var_data)
-                    print(f"Added new computational variable: {new_var_data.get('name', new_var_data['id'])}")
-                else:
-                    print(f"Warning: Attempted to add computational variable with duplicate prefixed ID '{new_var_data['id']}'. Skipping.")
-
-        state["computational_variables"] = modified_computational_variables
-
-        print("\n---LLM Variable Modification Complete.---")
-
-    except Exception as e:
-        state["error"] = (state.get("error") or "") + f"Error modifying variables with LLM: {e}" # Concatenate
-        print(f"Error modifying variables with LLM: {e}")
-        # Do NOT return state here, allow processing to continue to next node
-        return state
-
-    return state
 
 # --- Langraph Node 4: modify_questionnaire_llm ---
 def modify_questionnaire_llm(state: GraphState) -> GraphState:

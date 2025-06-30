@@ -1,6 +1,6 @@
 from langchain_core.prompts import ChatPromptTemplate
 
-# --- Prompt 1: Assessment Variables Generation ---
+# --- Prompt 1: Assessment Variables Generation (RAG enabled) ---
 ASSESSMENT_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system",
@@ -17,151 +17,139 @@ ASSESSMENT_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
          "'var_name' (snake_case for coding, e.g., 'avg_daily_customers'), "
          "'priority' (integer, 1 being highest, 5 being lowest), 'description', "
          "'formula' (always null for assessment variables), "
-         "'type' (the type of expected input for this variable, e.g., 'text', 'int', 'float', 'boolean', 'date', 'dropdown')."
+         "'type' (the type of expected input for this variable, e.g., 'text', 'integer', 'float', 'boolean', 'dropdown'), "
+         "'value' (always null for assessment variables, this is for user input later), "
+         "'project_id' (the unique ID for the current project workflow). "
+         "**Ensure ALL fields in the schema are present and correctly formatted, including 'type', 'priority', and 'description'.**" # Explicit reminder
+         "Generate atleast 15 realistic and useful assessment variables that are relevant to small business income assessment. "
+         "\n\n--- Supplementary Context from Historical Data (use to inspire and refine, but prioritize main task and schema adherence) ---\n{context}\n----------------------------------------------------------------------" # Moved to end, clarified role
         ),
-        ("human",
-         "Based on the business context of '{prompt}', list the key assessment variables needed. "
-         "Ensure they are specific and measurable for income assessment of small business owners. "
-         "Exclude any variables that would require a complex formula to derive, as these are 'assessment' variables. "
-         "Prioritize variables that provide direct insight into income, costs, and operational stability."
+        ("human", "Based on the following user input and any existing variables, generate a list of assessment variables: {user_input}. "
+         "Existing variables to consider for modification or reference: {existing_variables}. "
+         "Provide the output in JSON format, strictly following the AssessmentVariablesOutput schema. "
+         "Ensure 'formula' is always null for assessment variables. "
+         "Ensure 'project_id' is included in each variable object using the provided project ID."
         )
     ]
 )
 
-# --- Prompt 2: Computational Variables Generation ---
+# --- Prompt 2: Computational Variables Generation (RAG enabled) ---
 COMPUTATIONAL_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system",
-         "You are an AI assistant for a fintech company. Your role is to define key computational variables "
-         "that can be derived from existing assessment variables for small business owners. "
-         "These derived variables will help in financial assessment and risk profiling. "
-         "For each computational variable, provide an 'id' (unique string), 'name' (display name), "
-         "'var_name' (snake_case), 'priority' (integer, 1 being highest), 'description', "
-         "and a 'formula' (a JavaScript string using the `var_name` of provided assessment variables, "
-         "e.g., 'assessment_var1 * assessment_var2'). "
-         "Also specify the 'type' of the computational variable's result (e.g., 'float', 'int')."
+         "You are an AI assistant helping a fintech company. Your task is to generate "
+         "computational variables based on assessment variables. These variables "
+         "should be directly derivable or calculated from the assessment variables "
+         "or other computational variables. "
+         "For each computational variable, provide 'id', 'name', 'var_name', 'priority', "
+         "'description', 'type' (e.g., 'float'), and a 'formula' (JavaScript string) "
+         "that calculates its value based on other 'var_name's. 'value' should be null. "
+         "Ensure 'project_id' is included. "
+         "**Generate meaningful and accurate JavaScript formulas which tell how the computational variables are to be computed from the assessment variables, strictly adhering to the schema.**" # Explicit reminder
+         "genrate atleast 10 computational variables that are relevant to small business income assessment. "
+         "\n\n--- Supplementary Context from Historical Data (use to inspire and refine, but prioritize main task and schema adherence) ---\n{context}\n----------------------------------------------------------------------" # Moved to end, clarified role
         ),
-        ("human",
-         "Given the following assessment variables: {assessment_var_names}. "
-         "Based on the overall prompt: '{prompt}', identify critical computational variables for "
-         "financial assessment of a small business. Provide clear formulas using the provided assessment variable names. "
-         "Examples of formulas could be 'monthly_revenue - monthly_operating_costs' for 'net_monthly_profit', "
-         "or 'avg_daily_customers * avg_transaction_value * 30' for 'estimated_monthly_revenue'."
+        ("human", "Given the following assessment variables:\n{assessment_variables}\n\n"
+         "And considering these existing computational variables for modification or reference:\n{existing_computational_variables}\n\n"
+         "Based on the user's initial input: '{user_input}', generate relevant computational variables. "
+         "Strictly provide the output in JSON format, following the ComputationalVariablesOutput schema. "
+         "Ensure all 'formula' values are valid JavaScript expressions that can be evaluated. "
+         "Example formula: 'return q_daily_sales * q_num_days_week * 4;' if q_daily_sales is an assessment variable. "
+         "Only include variables that are directly calculable from the provided assessment variables. "
+         "Ensure 'project_id' is included in each variable object using the provided project ID."
         )
     ]
 )
 
-# --- Prompt 3: Questionnaire Generation ---
+# --- Prompt 3: Questionnaire Generation (RAG enabled) ---
 QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system",
-         "You are an AI assistant specialized in designing user interview questionnaires for financial assessments "
-         "of subprime small business owners. "
-         "Your task is to create a structured survey (JSON format expected) that effectively captures data "
-         "for the provided assessment variables. "
-         "Try generating atleast 15-20 questions, ensuring a mix of core and conditional questions. "
-         "Also make sure to generate optional sections that can be conditionally displayed based on user responses. "
-         "The questionnaire should be divided into logical 'sections'. Each section must have: "
-         "- 'title': A clear title for the section. "
-         "- 'description': A brief explanation of the section's purpose. "
-         "- 'order': An integer indicating the display order. "
-         "- 'is_mandatory': Boolean (true/false) indicating if the section is always shown. "
-         "- 'rationale': Explanation for why this section is important. "
-         "- 'core_questions': An array of Question objects that are always asked if the section is shown. "
-         "- 'conditional_questions': An array of Question objects that appear based on 'triggering_criteria'. "
-         "- 'triggering_criteria': (Optional) A JavaScript function body string (e.g., 'return q_previous_answer === \"Yes\";') for the section itself. "
-         "  If 'is_mandatory' is true, this should be `null`. If 'is_mandatory' is false, this MUST be a **complex, intelligent, and realistic** JavaScript function string. This cannot be `null` or a simplistic `return true;`. "
-         "- 'data_validation': A JavaScript function body string for overall section validation (e.g., 'return q_field1 > 0;'). Default to 'return true;'. "
-         "\n"
-         "Each 'Question' object must have: "
-         "- 'id': Unique string. "
-         "- 'text': The actual question. "
-         "- 'type': Expected input type ('text', 'integer', 'float', 'boolean', 'dropdown'). "
-         "- 'variable_name': A unique snake_case string for the question's answer (e.g., 'q_business_age'). "
-         "- 'triggering_criteria': (Optional) A JavaScript function body string. If the question is in 'core_questions', this should be `null`. If in 'conditional_questions', this MUST be a **complex, intelligent, and realistic** JavaScript function string, using 'q_' prefixed variable names from earlier questions (e.g., 'return q_has_dependents === true;'). This cannot be `null` or a simplistic `return true;`. "
-         "- 'assessment_variables': An array of `var_name`s of assessment variables this question helps capture. "
-         "- 'formula': A JavaScript function body string (e.g., 'return parseFloat(q_daily_sales) * 30;') describing how the question's raw answer contributes to an assessment variable, or performs a relevant calculation. This formula is for the *question's contribution*, not for an assessment variable's final calculation."
-         "- 'is_conditional': (Optional) Boolean indicating if the question is conditional. If question_triggering_criteria is provided, this should be true. "
-         "\n"
-         "Ensure `variable_name` for questions are prefixed with 'q_'. "
-         "Prioritize a logical flow for the questionnaire. Use the provided `assessment_vars_json` as the source of truth for variables to cover. "
-         "Make sure to cover all relevant assessment variables with at least one question. "
-         "The output should be a JSON object conforming to the `QuestionnaireOutput` schema."
+         "You are an AI assistant that designs comprehensive and logical questionnaires "
+         "for small business financial assessment. Your task is to generate a questionnaire "
+         "structure, organized into sections. Each `Section` must explicitly contain two lists of questions: "
+         "`core_questions` and `conditional_questions`. "
+         "Each `Question` within these lists should be designed to collect data for "
+         "the provided assessment and computational variables. "
+         "For each `Question`, provide a unique 'id', 'text', 'type' "
+         "(e.g., 'text', 'integer', 'float', 'boolean', 'dropdown'), 'variable_name' (snake_case), "
+         "'triggering_criteria' (If is_mandatory == false; triggering_criteria is a MANDATORY FIELD that has to tell what triggers the optional section), "
+         "'assessment_variables' (list of 'var_name's they impact), 'is_mandatory' (boolean), "
+         "'is_conditional' (boolean), and 'formula' (a MANDATORY FIELD that tells how the assessment variables map to the question variables). "
+         "Do not include an 'options' field in the Question schema. "
+         "Ensure all variables in 'assessment_variables' list within questions map to actual 'var_name's "
+         "from the provided assessment_variables. "
+         "**IMPORTANT NOTE**: More than one  question can be mapped to one assessment variable, if that allows the question to be smaller and easier to answer."
+         "For example: Monthly expenses for a tea stall can be broken down into multiple questions like: monthly rent, monthly milk cost, monthly sugar cost, etc. Then they can map to a single assessment variable called 'monthly_expenses'. "
+         "Design a logical flow. If a question's answer is dependent on a previous question, "
+         "use 'triggering_criteria'. if is_conditional is true, then 'triggering_criteria' must be a JS function that returns what triggers the conditional question. "
+         "**Ensure ALL fields in the schema are present and correctly formatted, including 'is_mandatory', 'is_conditional', and 'formula'. Generate realistic and useful triggers/formulas.**" # Explicit reminder
+         "Ensure that there are at least 5 sections, with a mix of core and conditional questions. Each section should have atleast 4 questions. Make sure to include atleast one optional section and atleast one conditional question. make sure they are intelligent and meaningful in the context of financial assessment. "
+         "\n\n--- Supplementary Context from Historical Data (use to inspire and refine, but prioritize main task and schema adherence) ---\n{context}\n----------------------------------------------------------------------" # Moved to end, clarified role
         ),
-        ("human",
-         "Generate a detailed interview questionnaire for a small business owner based on the primary prompt: '{prompt_context}'. "
-         "The questions should aim to gather data for the following assessment variables:\n{assessment_vars_json}\n\n"
-         "Structure the questionnaire into logical sections with both core and conditional questions, "
-         "ensuring all conditional logic (triggering_criteria) for sections and questions are **meaningful JavaScript expressions** using `q_` prefixed question variables. "
-         "Also, provide appropriate JavaScript formulas for each question to process its raw input. "
-         "The response should be a JSON object." # Added "The response should be a JSON object."
+        ("human", "Generate a questionnaire based on the user's prompt: '{user_input}'. "
+         "The questionnaire should gather data for these assessment variables:\n{assessment_variables}\n\n"
+         "And these computational variables:\n{computational_variables}\n\n"
+         "Strictly provide the output in JSON format, following the QuestionnaireOutput schema. "
+         "Ensure logical ordering, comprehensive coverage of variables, and appropriate question types. "
+         "Add meaningful 'triggering_criteria' for conditional sections/questions, and 'formula' for calculated questions where applicable. "
+         "Ensure 'project_id' is included in each section and question object."
         )
     ]
 )
 
-# --- Prompt 4: Variable Modifications ---
+# --- Prompt 4: Variable Modifications (RAG context removed) ---
 VARIABLE_MODIFICATIONS_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system",
-         "You are an AI assistant tasked with modifying lists of assessment and computational variables. "
-         "You will receive the current lists and a user's modification request. "
-         "Your response should be a JSON object detailing additions, updates, and removals for both types of variables. "
-         "For 'updated_assessment_variables' and 'updated_computational_variables', provide the 'id' and only the fields that need to be changed. "
-         "For 'added_assessment_variables' and 'added_computational_variables', provide all required fields ('id', 'name', 'var_name', 'priority', 'description', 'type', and 'formula' for computational). "
-         "For computational variables, ensure new or updated 'formula' fields are valid JavaScript strings referencing existing assessment variables (e.g., 'var1 + var2'). "
-         "The output should be a JSON object conforming to the `VariableModificationsOutput` schema."
+         "You are an AI assistant tasked with modifying a list of assessment and computational variables. "
+         "Based on the 'modification_request', you need to identify which variables to add, update, or remove. "
+         "For updates, specify the 'id' and the fields to change in the 'updates' dictionary. For removals, specify the 'id'. "
+         "For additions, create new variables following the VariableSchema, ensuring 'id' is a new UUID. "
+         "Your output must strictly follow the VariableModificationsOutput schema. "
+         "Ensure 'project_id' is preserved for updated/removed variables and set for new ones. "
         ),
-        ("human",
-         "Current Assessment Variables:\n{assessment_vars_json}\n\n"
-         "Current Computational Variables:\n{computational_vars_json}\n\n"
-         "User's modification request: {modification_prompt}\n\n"
-         "Please provide a JSON object with the requested modifications."
+        ("human", "Based on this modification request: '{modification_request}', "
+         "and the current assessment variables:\n{current_assessment_variables}\n\n"
+         "And current computational variables:\n{current_computational_variables}\n\n"
+         "Generate the necessary modifications. If no changes are needed, return empty lists/dictionaries for all modification types."
         )
     ]
 )
 
-# --- Prompt 5: Questionnaire Modifications ---
+# --- Prompt 5: Questionnaire Modifications (RAG context removed) ---
 QUESTIONNAIRE_MODIFICATIONS_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system",
-         "You are an AI assistant specialized in modifying existing survey questionnaires. "
-         "You will receive the current questionnaire structure (JSON format), a user's modification prompt, "
-         "and the current assessment variables for context. "
-         "Your task is to generate a JSON object (conforming to `QuestionnaireModificationsOutput` schema) "
-         "specifying changes to sections and questions. "
-         "\n"
-         "You can: "
-         "- `added_sections`: Add new sections. Provide full section objects. Ensure new sections have unique 'order' numbers. "
-         "- `updated_sections`: Update existing sections. Provide 'order' and fields to change. "
-         "  If `is_mandatory` is false, `triggering_criteria` MUST be a **complex, intelligent, and realistic** JavaScript function string (not null or 'return true;'). "
-         "- `removed_section_orders`: Remove sections by their 'order' number. "
-         "- `added_questions`: Add new questions to specific sections. Provide `section_order`, `is_core` (boolean), and a full `question` object. "
-         "- `updated_questions`: Update existing questions by their `id`. Provide `id` and fields to change. "
-         "  If a question becomes conditional (`is_core` changes to false or moved to `conditional_questions`), its `triggering_criteria` MUST be a **complex, intelligent, and realistic** JavaScript function string. "
-         "  'formula' should always be a JavaScript expression."
-         "- `removed_question_variable_names`: Remove questions by their `variable_name`. "
-         "\n"
-         "Ensure all IDs are unique. Ensure `variable_name` for questions are prefixed with 'q_'. "
-         "When adding or updating conditional sections or questions, ensure their `triggering_criteria` are **meaningful JavaScript expressions** that logically relate to other `q_` prefixed question variables from the current questionnaire context. "
-         "The response should be a JSON object specifying these modifications."
+         "You are an AI assistant tasked with modifying a JSON representation of a questionnaire. "
+         "Based on the 'modification_request', you need to identify which sections/questions to add, update, or remove. "
+         "For updates on sections, specify the 'order' of the section and the fields to change in the 'updates' dictionary. "
+         "For updates on questions, specify the 'id' of the question and the fields to change in the 'updates' dictionary. "
+         "For removals, specify the 'order' for sections or 'variable_name' for questions. "
+         "For additions, create new sections/questions following their respective schemas, ensuring 'id' is a new UUID for questions. "
+         "For added questions, specify `section_order` and `is_core` to indicate whether it belongs to `core_questions` or `conditional_questions`. "
+         "Your output must strictly follow the QuestionnaireModificationsOutput schema. "
+         "Ensure 'project_id' is preserved for updated/removed entities and set for new ones. "
         ),
-        ("human",
-         "Current Questionnaire:\n{questionnaire_json}\n\n"
-         "Current Assessment Variables (for context):\n{assessment_vars_json}\n\n"
-         "User's modification request: {modification_prompt}\n\n"
-         "Please provide a JSON object detailing the requested modifications to the questionnaire."
+        ("human", "Based on this modification request: '{modification_request}', "
+         "and the current questionnaire structure:\n{current_questionnaire}\n\n"
+         "Generate the necessary modifications. If no changes are needed, return empty lists/dictionaries for all modification types."
         )
     ]
 )
 
-# --- Prompt for JS Expression Refinement (triggered by _refine_js_expression) ---
+
+# --- Prompt 6: JavaScript Expression Refinement (Remains same) ---
 JS_REFINEMENT_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system",
-         "You are an expert JavaScript developer specializing in dynamic form logic for financial assessments. "
-         "You need to generate a **complex and intelligent** JavaScript expression for a '{expression_type}' field. "
-         "This expression must be a valid JavaScript function body (e.g., 'return q_var1 > 0 && q_var2 === \"Yes\";'). "
-         "It must use variable names that start with 'q_' and are from the provided `context_question_vars`. "
+         "You are a JavaScript expert. Your task is to refine or generate a JavaScript expression. "
+         "The expression should be concise, syntactically correct, and semantically meaningful "
+         "for financial assessment logic. If it's a triggering criteria, it must return a boolean. "
+         "If it's a formula, it must return a calculated value. "
+         "You can assume that variables from previous questions will be available and are prefixed with 'q_'. "
+         "For example, 'q_income' for an income question. "
+         "Available question variables are provided as `context_question_vars`. "
          "Avoid simplistic 'return true;' or empty expressions. "
          "The purpose is to create a dynamic condition for '{target_entity_description}'. "
          "Available question variables: {context_question_vars}. "
@@ -169,11 +157,11 @@ JS_REFINEMENT_PROMPT = ChatPromptTemplate.from_messages(
          "Consider using logical operators (&&, ||, !), numerical comparisons (>, <, >=, <=, ===), "
          "string comparisons, or checking for specific values. "
          "Examples for triggers: 'return q_has_dependents === true && q_income_source === \"Self-employed\";', "
-         "'return q_business_type.includes(\"online\") || q_monthly_sales > 5000;'. "
+         "'return q_business_type.includes(\\\"online\\\") || q_monthly_sales > 5000;'. "
         ),
-        ("human",
-         "Generate a suitable JavaScript expression for the '{expression_type}' of '{target_entity_description}'. "
+        ("human", "Generate a suitable JavaScript expression for the '{expression_type}' of '{target_entity_description}'. "
          "It should be intelligent and meaningful in the context of financial assessment conditional logic. "
+         "The expression to refine is: ['expression_to_refine']. "
          "If '{expression_type}' is a formula, it should describe how the question's answer contributes to an assessment variable, or perform a relevant calculation. "
          "If '{expression_type}' is a triggering criteria, it should determine when a section or question is displayed."
         )

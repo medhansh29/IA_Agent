@@ -5,8 +5,9 @@ import json
 from typing import Optional, Dict, List, Any, cast # Import 'cast'
 import uuid # Import uuid for generating project_id
 
-# Import GraphState and individual node functions from main.py
-from main import (
+# Import GraphState and individual node functions from nodes.py
+# Now importing the internal, granular generation functions
+from nodes import (
     GraphState,
     generate_variables,
     generate_questionnaire,
@@ -36,6 +37,7 @@ class SharedWorkflowState(BaseModel):
     """
     prompt: str
     modification_prompt: Optional[str] = None # This will be set by specific modification endpoints
+    modification_history: Optional[List[str]] = None # History of modifications, if needed
     assessment_variables: Optional[List[Dict[str, Any]]] = None
     computational_variables: Optional[List[Dict[str, Any]]] = None
     questionnaire: Optional[Dict[str, Any]] = None
@@ -51,12 +53,12 @@ class ModificationRequest(BaseModel):
 
 # --- API Endpoints for Step-by-Step Workflow ---
 
-@api_app.post("/step/generate-assessment-variables", response_model=SharedWorkflowState, summary="Step 1: Generate Initial Assessment Variables")
-async def step_generate_assessment_variables(request: InitialWorkflowRequest):
+@api_app.post("/step/generate-variables", response_model=SharedWorkflowState, summary="Step 1: Generate Initial Variables")
+async def step_generate_variables(request: InitialWorkflowRequest):
     """
-    Initiates the workflow by generating initial assessment variables based on the provided prompt.
+    Initiates the workflow by generating initial assessment and computational variables based on the provided prompt.
     A unique `project_id` is generated for this workflow run.
-    Returns the initial state with assessment variables populated.
+    Returns the initial state with both assessment and computational variables populated.
     """
     try:
         new_project_id = str(uuid.uuid4()) # Generate a new UUID for the project
@@ -65,20 +67,20 @@ async def step_generate_assessment_variables(request: InitialWorkflowRequest):
         initial_state = cast(GraphState, {
             "prompt": request.prompt,
             "modification_prompt": None,
-            "assessment_variables": None,
-            "computational_variables": None,
+            "assessment_variables": None, # Ensure AVs are explicitly None to trigger generation
+            "computational_variables": None, # Ensure CVs are explicitly None to trigger generation
             "questionnaire": None,
             "error": None,
             "project_id": new_project_id # Set the new project_id
         })
         
-        # Invoke generate_variables. It will generate AVs first as CVs are None.
+        # Use the existing generate_variables function which handles both types
         updated_state = generate_variables(initial_state)
 
         return SharedWorkflowState(**updated_state)
 
     except Exception as e:
-        print(f"Error in /step/generate-assessment-variables: {e}")
+        print(f"Error in /step/generate-variables: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -91,10 +93,20 @@ async def step_modify_assessment_variables(request: ModificationRequest):
     """
     try:
         current_state = cast(GraphState, request.current_state.model_dump())
+        # ADD THIS: Track modification history
+        if current_state.get("modification_history") is None:
+            current_state["modification_history"] = []
+        
+        # Add the new modification to history
+        # Ensure modification_history is a list before appending
+        if not isinstance(current_state["modification_history"], list):
+            current_state["modification_history"] = []
+        current_state["modification_history"].append(request.modification_prompt)
+        
+        # Still update the current modification prompt
         current_state["modification_prompt"] = request.modification_prompt
         
         updated_state = modify_variables_llm(current_state)
-        
         return SharedWorkflowState(**updated_state)
 
     except Exception as e:
@@ -121,26 +133,7 @@ async def step_finalize_assessment_variables(request: SharedWorkflowState):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@api_app.post("/step/generate-computational-variables", response_model=SharedWorkflowState, summary="Step 4: Generate Computational Variables")
-async def step_generate_computational_variables(request: SharedWorkflowState):
-    """
-    Generates computational variables based on the current assessment variables.
-    This function will ensure that computational variables are generated if they are not already present.
-    Returns the updated state with computational variables populated.
-    """
-    try:
-        current_state = cast(GraphState, request.model_dump())
-        
-        updated_state = generate_variables(current_state) 
-        
-        return SharedWorkflowState(**updated_state)
-
-    except Exception as e:
-        print(f"Error in /step/generate-computational-variables: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
-@api_app.post("/step/modify-computational-variables", response_model=SharedWorkflowState, summary="Step 5: Modify Computational Variables")
+@api_app.post("/step/modify-computational-variables", response_model=SharedWorkflowState, summary="Step 4: Modify Computational Variables")
 async def step_modify_computational_variables(request: ModificationRequest):
     """
     Applies LLM-driven modifications to the computational variables based on the `modification_prompt`.
@@ -160,7 +153,7 @@ async def step_modify_computational_variables(request: ModificationRequest):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@api_app.post("/step/finalize-computational-variables", response_model=SharedWorkflowState, summary="Step 6: Finalize and Save Computational Variables to DB")
+@api_app.post("/step/finalize-computational-variables", response_model=SharedWorkflowState, summary="Step 5: Finalize and Save Computational Variables to DB")
 async def step_finalize_computational_variables(request: SharedWorkflowState):
     """
     Finalizes the computational variables by saving them to the database.
@@ -179,7 +172,7 @@ async def step_finalize_computational_variables(request: SharedWorkflowState):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@api_app.post("/step/generate-questionnaire", response_model=SharedWorkflowState, summary="Step 7: Generate Questionnaire")
+@api_app.post("/step/generate-questionnaire", response_model=SharedWorkflowState, summary="Step 6: Generate Questionnaire")
 async def step_generate_questionnaire(request: SharedWorkflowState):
     """
     Generates the questionnaire based on the finalized assessment and computational variables.
@@ -197,7 +190,7 @@ async def step_generate_questionnaire(request: SharedWorkflowState):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@api_app.post("/step/modify-questionnaire", response_model=SharedWorkflowState, summary="Step 8: Modify Questionnaire")
+@api_app.post("/step/modify-questionnaire", response_model=SharedWorkflowState, summary="Step 7: Modify Questionnaire")
 async def step_modify_questionnaire(request: ModificationRequest):
     """
     Applies LLM-driven modifications to the questionnaire structure based on the `modification_prompt`.
@@ -216,7 +209,7 @@ async def step_modify_questionnaire(request: ModificationRequest):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@api_app.post("/step/analyze-impact", response_model=SharedWorkflowState, summary="Step 9: Analyze Questionnaire Impact and Remediate")
+@api_app.post("/step/analyze-impact", response_model=SharedWorkflowState, summary="Step 8: Analyze Questionnaire Impact and Remediate")
 async def step_analyze_impact(request: SharedWorkflowState):
     """
     Analyzes the questionnaire for completeness and consistency with assessment variables.
@@ -235,7 +228,7 @@ async def step_analyze_impact(request: SharedWorkflowState):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@api_app.post("/step/save-questionnaire", response_model=SharedWorkflowState, summary="Step 10: Save Final Questionnaire to DB")
+@api_app.post("/step/save-questionnaire", response_model=SharedWorkflowState, summary="Step 9: Save Final Questionnaire to DB")
 async def step_save_questionnaire(request: SharedWorkflowState):
     """
     Saves the final questionnaire to Supabase. This will also upsert any variables again.
@@ -259,3 +252,26 @@ async def step_save_questionnaire(request: SharedWorkflowState):
 
 # You can then access the API documentation at http://127.0.0.1:8000/docs
 # and make POST requests to the new endpoints (e.g., http://127.0.0.1:8000/step/generate-assessment-variables)
+    """
+    Saves the final questionnaire to Supabase. This will also upsert any variables again.
+    Returns the final state with potential errors from the save operation.
+    """
+    try:
+        current_state = cast(GraphState, request.model_dump())
+        
+        updated_state = write_to_supabase(current_state)
+        
+        return SharedWorkflowState(**updated_state)
+
+    except Exception as e:
+        print(f"Error in /step/save-questionnaire: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# To run this FastAPI application, save it as `api.py` and run:
+# uvicorn api:api_app --host 0.0.0.0 --port 8000 --reload
+# (Use --reload for development to automatically restart on code changes)
+
+# You can then access the API documentation at http://127.0.0.1:8000/docs
+# and make POST requests to the new endpoints (e.g., http://127.0.0.1:8000/step/generate-assessment-variables)
+
