@@ -2,7 +2,8 @@ import os
 import json
 import uuid
 import requests
-from typing import List, Dict, Optional, Any
+import re
+from typing import List, Dict, Optional, Any, cast
 from dotenv import load_dotenv
 import time # Import for sleep function
 
@@ -11,24 +12,31 @@ from langchain_core.prompts import ChatPromptTemplate
 
 # Import prompts from the new prompts.py file
 from prompts import (
-    ASSESSMENT_VARIABLES_PROMPT,
-    COMPUTATIONAL_VARIABLES_PROMPT,
+    RAW_INDICATORS_PROMPT,
+    DECISION_VARIABLES_PROMPT,
+    INTELLIGENT_VARIABLE_MODIFICATIONS_PROMPT,
+    DEPENDENCY_ANALYSIS_PROMPT,
     QUESTIONNAIRE_PROMPT,
-    VARIABLE_MODIFICATIONS_PROMPT,
     QUESTIONNAIRE_MODIFICATIONS_PROMPT,
-    JS_REFINEMENT_PROMPT
+    JS_REFINEMENT_PROMPT,
+    INTELLIGENT_QUESTIONNAIRE_MODIFICATIONS_PROMPT
 )
 
 # Import schemas from the new schemas.py file
 from schemas.schemas import (
     GraphState,
     VariableSchema,
-    AssessmentVariablesOutput,
-    ComputationalVariablesOutput,
+    RawIndicatorsOutput,
+    DecisionVariablesOutput,
+    IntelligentVariableModificationsOutput,
+    DependencyInfo,
+    ImpactAnalysis,
+    DependencyGraph,
+    IntelligentModificationRequest,
+    SynchronizationPlan,
     Question,
     Section,
     QuestionnaireOutput,
-    VariableModificationsOutput,
     QuestionnaireModificationsOutput,
     RemediationOutput,
     StringOutput
@@ -114,9 +122,9 @@ def _refine_js_expression(llm_instance: ChatOpenAI, expression_type: str, curren
     print(f"Failed to get any response from LLM for {expression_type} on {target_entity_description} after {max_retries} attempts.")
     return f"// LLM FAILED TO RESPOND: No expression generated after {max_retries} attempts. Review {target_entity_description}."
 
-def _apply_default_variable_properties(var: Dict, is_assessment_var: bool = True, project_id: Optional[str] = None):
+def _apply_default_variable_properties(var: Dict, is_raw_indicator: bool = True, project_id: Optional[str] = None):
     """
-    Helper to apply default properties to a variable (assessment or computational).
+    Helper to apply default properties to a variable (raw indicator or decision variable).
     Includes project_id.
     Ensures the 'id' field is unique per project by prepending project_id.
     """
@@ -139,133 +147,97 @@ def _apply_default_variable_properties(var: Dict, is_assessment_var: bool = True
     else:
         var['var_name'] = var['var_name'].lower().replace(' ', '_').replace('-', '_').replace('.', '') # Ensure snake_case if provided
 
-    if 'priority' not in var or not isinstance(var['priority'], int):
-        var['priority'] = 5 # Default priority
+    if 'impact_score' not in var or not isinstance(var['impact_score'], int):
+        var['impact_score'] = 50 # Default impact_score (midpoint)
+    if 'priority' in var:
+        del var['priority']
 
     if 'description' not in var or not var['description']:
-        var['description'] = f"{'Assessment' if is_assessment_var else 'Computational'} variable for {var['name']}"
+        var['description'] = f"{'Raw indicator' if is_raw_indicator else 'Decision variable'} for {var['name']}"
     
-    if is_assessment_var:
-        var["formula"] = None # Assessment variables have null formula
+    # Add priority_rationale if not present
+    if 'priority_rationale' not in var or not var['priority_rationale']:
+        var['priority_rationale'] = f"Priority {var.get('impact_score', 50)} assigned based on importance for income assessment"
+    
+    if is_raw_indicator:
+        var["formula"] = None # Raw indicators have null formula
         if 'type' not in var or not var['type']:
             var['type'] = "text"
-    else: # Computational variable
+    else: # Decision variable
         if 'formula' not in var or not var['formula']:
-            var['formula'] = "// Placeholder formula - please define based on assessment variables"
+            var['formula'] = "// Placeholder formula - please define based on raw indicators"
         if 'type' not in var or not var['type']:
-            var['type'] = "float" # Computational variables are often numerical
-
-def _process_question_properties(question: Dict, is_core_question: bool, all_existing_q_vars: set, state_error_ref: GraphState, project_id: Optional[str] = None):
-    """
-    Helper to apply default properties and refine JS expressions for a question.
-    all_existing_q_vars: Set of all question variable names in the current questionnaire for context.
-    state_error_ref: A mutable dictionary (or the state dict directly) to update with errors.
-    Includes project_id and sets is_conditional.
-    Ensures the 'id' field is unique per project by prepending project_id.
-    """
-    # Ensure the Supabase ID is unique per project and item
-    # Use the existing ID if present (e.g., 'q1', 'q2'), otherwise generate a new UUID for the suffix
-    base_id = question.get("id") or str(uuid.uuid4())
-    if project_id: # Only prepend if project_id is available
-        question["id"] = f"{project_id}_{base_id}"
-    else:
-        question["id"] = base_id
-
-    question["project_id"] = project_id # Add project_id
-    
-    if 'variable_name' not in question or not question['variable_name']:
-        question['variable_name'] = f"q_{uuid.uuid4().hex[:8]}"
-    else:
-        question['variable_name'] = question['variable_name'].lower().replace(' ', '_').replace('-', '_').replace('.', '')
-
-    # Ensure variable_name uniqueness and add to the set
-    if question['variable_name'] in all_existing_q_vars and question['variable_name'] != (question.get('original_variable_name_before_update')): # Avoid checking against itself during update
-        print(f"Warning: Duplicate variable_name '{question['variable_name']}' detected. Appending unique suffix.")
-        question['variable_name'] = f"{question['variable_name']}_{uuid.uuid4().hex[:4]}"
-    all_existing_q_vars.add(question['variable_name']) # Add new/unique var_name to context for subsequent refinements
-
-    if 'type' not in question or not question['type']:
-        question['type'] = 'text'
-    if 'text' not in question or not question['text']:
-        question['text'] = "New Question"
-
-    # Refine formula field
-    original_formula = question.get('formula')
-    # Pass a list conversion of the set for context_question_vars as _refine_js_expression expects List[str]
-    refined_formula = _refine_js_expression(
-        llm, "formula", original_formula,
-        list(all_existing_q_vars), f"formula for '{question.get('text')}'" 
-    )
-    question['formula'] = refined_formula
-    if "// LLM FAILED TO RESPOND" in refined_formula:
-        # Ensure state["error"] is always a string before concatenation
-        state_error_ref["error"] = (state_error_ref.get("error") or "") + f"ERROR: Formula for question '{question.get('text')}' is problematic. "
-
-    # Refine triggering_criteria if conditional
-    if not is_core_question:
-        original_criteria = question.get('triggering_criteria')
-        # Pass a list conversion of the set for context_question_vars as _refine_js_expression expects List[str]
-        refined_criteria = _refine_js_expression(
-            llm, "triggering_criteria", original_criteria,
-            list(all_existing_q_vars), f"conditional question '{question.get('text')}'", 
-            is_mandatory_flag=False
-        )
-        question['triggering_criteria'] = refined_criteria
-        # Set is_conditional based on whether triggering_criteria is present
-        question['is_conditional'] = bool(question['triggering_criteria']) # True if not None/empty string, False otherwise
-        if "// LLM FAILED TO RESPOND" in refined_criteria:
-            # Ensure state["error"] is always a string before concatenation
-            state_error_ref["error"] = (state_error_ref.get("error") or "") + f"ERROR: Conditional question '{question.get('text')}' has problematic triggering_criteria. "
-    else:
-        question['triggering_criteria'] = None # Core questions have null criteria
-        question['is_conditional'] = False # Core questions are never conditional
-        
-    if 'assessment_variables' not in question or not isinstance(question['assessment_variables'], list):
-        question['assessment_variables'] = []
+            var['type'] = "float" # Decision variables are often numerical
 
 def _process_section_properties(section: Dict, all_existing_q_vars: set, state_error_ref: GraphState, project_id: Optional[str] = None):
     """
-    Helper to apply default properties and refine JS expressions for a section.
-    all_existing_q_vars: Set of all question variable names in the current questionnaire for context.
-    state_error_ref: A mutable dictionary (or the state dict directly) to update with errors.
-    Includes project_id.
+    Process and validate section properties.
+    - is_mandatory defaults to True
+    - If is_mandatory is False, triggering_criteria is required
     """
-    section["project_id"] = project_id # Add project_id
-    if 'is_mandatory' not in section:
-        section['is_mandatory'] = True
-    if 'rationale' not in section:
-        section['rationale'] = "Generated rationale."
+    section["project_id"] = project_id
+    
+    # Handle is_mandatory (default: True)
+    is_mandatory = section.get('is_mandatory', True)
+    section['is_mandatory'] = is_mandatory
+    
+    # Validate triggering criteria
+    if not is_mandatory:
+        if 'triggering_criteria' not in section or not section['triggering_criteria']:
+            state_error_ref["error"] = f"Optional section missing triggering_criteria: {section.get('title', 'Untitled')}"
+    elif 'triggering_criteria' in section:
+        section['triggering_criteria'] = None  # Clear triggering criteria for mandatory sections
+    
+    # Ensure both question lists exist
     if 'core_questions' not in section:
         section['core_questions'] = []
     if 'conditional_questions' not in section:
         section['conditional_questions'] = []
-
-    # Refine section triggering_criteria if not mandatory
-    if not section['is_mandatory']:
-        original_criteria = section.get('triggering_criteria')
-        # Pass a list conversion of the set for context_question_vars as _refine_js_expression expects List[str]
-        refined_criteria = _refine_js_expression(
-            llm, "triggering_criteria", original_criteria,
-            list(all_existing_q_vars), f"section '{section.get('title')}'", 
-            is_mandatory_flag=False
-        )
-        section['triggering_criteria'] = refined_criteria
-        if "// LLM FAILED TO RESPOND" in refined_criteria:
-            # Ensure state["error"] is always a string before concatenation
-            state_error_ref["error"] = (state_error_ref.get("error") or "") + f"ERROR: Section '{section.get('title')}' has problematic triggering_criteria. "
-    else:
-        section['triggering_criteria'] = None # Mandatory sections should have null criteria
     
-    if 'data_validation' not in section:
-        section['data_validation'] = "return true;" # Default validation
+    return section
 
+def _process_question_properties(question: Dict, is_core_question: bool, all_existing_q_vars: set, state_error_ref: GraphState, project_id: Optional[str] = None):
+    """
+    Process and validate question properties.
+    - is_conditional defaults to False
+    - If is_conditional is True, question_triggering_criteria is required
+    """
+    # Ensure the Supabase ID is unique per project and item
+    base_id = question.get("id") or str(uuid.uuid4())
+    if project_id:  # Only prepend if project_id is available
+        question["id"] = f"{project_id}_{base_id}"
+    else:
+        question["id"] = base_id
+
+    # Handle is_conditional (default: False)
+    is_conditional = question.get('is_conditional', False)
+    question['is_conditional'] = is_conditional
+    
+    # Validate question_triggering_criteria
+    if is_conditional:
+        if 'question_triggering_criteria' not in question or not question['question_triggering_criteria']:
+            state_error_ref["error"] = f"Conditional question missing question_triggering_criteria: {question.get('text', 'Untitled')}"
+    elif 'question_triggering_criteria' in question:
+        question['question_triggering_criteria'] = None  # Clear triggering criteria for non-conditional questions
+    
+    # Validate other required fields
+    required_fields = ['text', 'type', 'variable_name', 'raw_indicators', 'formula']
+    for field in required_fields:
+        if field not in question or not question[field]:
+            state_error_ref["error"] = f"Question missing required field '{field}': {question.get('text', 'Untitled')}"
+            return question
+
+    # Add question's variable name to the set of all question variables
+    all_existing_q_vars.add(question['variable_name'])
+    
+    return question
 
 # --- Langraph Node 1: generate_variables ---
 def generate_variables(state: GraphState) -> GraphState:
     """
-    Generates initial assessment and computational variables based on the user's prompt.
-    It prompts an LLM twice: first for assessment variables, then for computational
-    variables based on the suggested assessment variables.
+    Generates initial raw indicators and decision variables based on the user's prompt.
+    It prompts an LLM twice: first for raw indicators, then for decision variables
+    based on the suggested raw indicators.
     """
     print("---GENERATING INITIAL VARIABLES---")
     # Ensure state["error"] is a string at the start of this node
@@ -273,8 +245,8 @@ def generate_variables(state: GraphState) -> GraphState:
 
     prompt_text = state["prompt"]
     project_id = state.get("project_id") # Get project_id from state
-    current_assessment_variables = state.get("assessment_variables", [])
-    current_computational_variables = state.get("computational_variables", [])
+    current_raw_indicators = state.get("raw_indicators", [])
+    current_decision_variables = state.get("decision_variables", [])
 
     # Get RAG context
     context_docs = []
@@ -287,296 +259,294 @@ def generate_variables(state: GraphState) -> GraphState:
             print(f"Warning: Could not retrieve RAG context: {e}")
             context_docs = []
 
-    # Step 1: Identify Assessment Variables using LLM
-    if not current_assessment_variables:
-        print("Generating Assessment Variables...")
-        assessment_chain = ASSESSMENT_VARIABLES_PROMPT | llm.with_structured_output(AssessmentVariablesOutput, method='function_calling')
+    # Step 1: Identify Raw Indicators using LLM
+    if not current_raw_indicators:
+        print("Generating Raw Indicators...")
+        raw_indicators_chain = RAW_INDICATORS_PROMPT | llm.with_structured_output(RawIndicatorsOutput, method='function_calling')
 
         try:
-            llm_response = assessment_chain.invoke({
+            llm_response = raw_indicators_chain.invoke({
                 "user_input": prompt_text,
-                "existing_variables": json.dumps(current_assessment_variables),
+                "existing_variables": json.dumps(current_raw_indicators),
                 "context": context_docs # Pass RAG context
             })
-            suggested_assessment_vars = llm_response.get("assessment_variables", [])
+            suggested_raw_indicators = llm_response.get("raw_indicators", [])
 
-            for var in suggested_assessment_vars:
-                _apply_default_variable_properties(var, is_assessment_var=True, project_id=project_id) # Pass project_id
+            for var in suggested_raw_indicators:
+                _apply_default_variable_properties(var, is_raw_indicator=True, project_id=project_id) # Pass project_id
 
-            state["assessment_variables"] = suggested_assessment_vars
-            print("\n---Initial Suggested Assessment Variables:---")
-            print(json.dumps(suggested_assessment_vars, indent=2))
+            state["raw_indicators"] = suggested_raw_indicators
+            print("\n---Initial Suggested Raw Indicators:---")
+            print(json.dumps(suggested_raw_indicators, indent=2))
 
         except Exception as e:
-            state["error"] = (state.get("error") or "") + f"Error generating assessment variables: {e}" # Concatenate
-            print(f"Error generating assessment variables: {e}")
+            state["error"] = (state.get("error") or "") + f"Error generating raw indicators: {e}" # Concatenate
+            print(f"Error generating raw indicators: {e}")
             return state # Critical failure, stop workflow
 
-    # Step 2: Create Computational Variables using LLM
-    if state["assessment_variables"] and not current_computational_variables:
-        print("\nGenerating Computational Variables...")
-        assessment_var_names = ", ".join([v["var_name"] for v in state["assessment_variables"]])
+    # Step 2: Create Decision Variables using LLM
+    if state["raw_indicators"] and not current_decision_variables:
+        print("\nGenerating Decision Variables...")
+        raw_indicator_names = ", ".join([v["var_name"] for v in state["raw_indicators"]])
 
-        # Use RAG context for computational variables based on assessment var names
-        comp_context_docs = []
+        # Use RAG context for decision variables based on raw indicator names
+        decision_context_docs = []
         if retriever:
             try:
-                print(f"Retrieving RAG context for computational variables based on: {assessment_var_names}")
-                comp_context_docs = retriever.invoke(assessment_var_names)
-                print(f"Retrieved {len(comp_context_docs)} context documents for computational variables.")
+                print(f"Retrieving RAG context for decision variables based on: {raw_indicator_names}")
+                decision_context_docs = retriever.invoke(raw_indicator_names)
+                print(f"Retrieved {len(decision_context_docs)} context documents for decision variables.")
             except Exception as e:
-                print(f"Warning: Could not retrieve RAG context for computational variables: {e}")
-                comp_context_docs = []
+                print(f"Warning: Could not retrieve RAG context for decision variables: {e}")
+                decision_context_docs = []
 
-        computational_chain = COMPUTATIONAL_VARIABLES_PROMPT | llm.with_structured_output(ComputationalVariablesOutput, method='function_calling')
+        decision_variables_chain = DECISION_VARIABLES_PROMPT | llm.with_structured_output(DecisionVariablesOutput, method='function_calling')
 
         try:
-            llm_response = computational_chain.invoke({
-                "assessment_variables": json.dumps([{"var_name": v["var_name"], "name": v["name"], "type": v["type"]} for v in state["assessment_variables"]]),
-                "existing_computational_variables": json.dumps(current_computational_variables),
+            llm_response = decision_variables_chain.invoke({
+                "raw_indicators": json.dumps([{"var_name": v["var_name"], "name": v["name"], "type": v["type"]} for v in state["raw_indicators"]]),
+                "existing_decision_variables": json.dumps(current_decision_variables),
                 "user_input": prompt_text,
-                "context": comp_context_docs # Pass RAG context
+                "context": decision_context_docs # Pass RAG context
             })
-            suggested_computational_vars = llm_response.get("computational_variables", [])
+            suggested_decision_vars = llm_response.get("decision_variables", [])
 
-            for var in suggested_computational_vars:
-                _apply_default_variable_properties(var, is_assessment_var=False, project_id=project_id) # Pass project_id
+            for var in suggested_decision_vars:
+                _apply_default_variable_properties(var, is_raw_indicator=False, project_id=project_id) # Pass project_id
 
-            state["computational_variables"] = suggested_computational_vars
-            print("\n---Initial Suggested Computational Variables:---")
-            print(json.dumps(suggested_computational_vars, indent=2))
+            state["decision_variables"] = suggested_decision_vars
+            print("\n---Initial Suggested Decision Variables:---")
+            print(json.dumps(suggested_decision_vars, indent=2))
 
         except Exception as e:
-            state["error"] = (state.get("error") or "") + f"Error generating computational variables: {e}" # Concatenate
-            print(f"Error generating computational variables: {e}")
+            state["error"] = (state.get("error") or "") + f"Error generating decision variables: {e}" # Concatenate
+            print(f"Error generating decision variables: {e}")
             return state # Critical failure, stop workflow
 
     return state
 
-def modify_variables_llm(state: GraphState) -> GraphState:
+def modify_variables_intelligent(state: GraphState) -> GraphState:
     """
-    Allows an LLM to modify assessment and computational variables based on a modification prompt.
-    The LLM can add, update, or remove variables.
+    Enhanced variable modification with intelligent synchronization.
     """
-    print("\n---MODIFYING VARIABLES USING LLM---")
-    # Ensure state["error"] is a string at the start of this node
-    state["error"] = state.get("error", "")
-
-    modification_prompt = state.get("modification_prompt")
-    current_assessment_variables = state.get("assessment_variables")
-    if current_assessment_variables is None:
-        current_assessment_variables = []
+    print("---INTELLIGENT VARIABLE MODIFICATION---")
     
-    current_computational_variables = state.get("computational_variables")
-    if current_computational_variables is None:
-        current_computational_variables = []
-
+    modification_prompt = state.get("modification_prompt")
     if not modification_prompt:
-        print("No modification prompt provided. Skipping LLM variable modification.")
+        print("No modification prompt provided. Skipping intelligent variable modification.")
         return state
-
-    print(f"Applying variable modifications based on: '{modification_prompt}'")
-    modification_chain = VARIABLE_MODIFICATIONS_PROMPT | llm.with_structured_output(VariableModificationsOutput, method='function_calling')
-
+    
+    raw_indicators = state.get("raw_indicators", []) or []
+    decision_variables = state.get("decision_variables", []) or []
+    dependency_graph = state.get("dependency_graph", {})
+    project_id = state.get("project_id", "") or ""
+    
+    if not dependency_graph:
+        print("No dependency graph available. Running dependency analysis first...")
+        state = analyze_variable_dependencies_node(state)
+        dependency_graph = state.get("dependency_graph", {})
+    
     try:
-        llm_response = modification_chain.invoke({
-            "current_assessment_variables": json.dumps(current_assessment_variables, indent=2),
-            "current_computational_variables": json.dumps(current_computational_variables, indent=2),
-            "modification_request": modification_prompt
+        # Prepare the intelligent modification request
+        business_context = f"Financial assessment for small business income evaluation. Project ID: {project_id}"
+        
+        # Determine modification type based on the prompt
+        modification_type = determine_modification_type(modification_prompt)
+        
+        intelligent_request = {
+            "primary_modifications": modification_prompt,
+            "dependency_analysis": json.dumps(dependency_graph, indent=2),
+            "auto_sync_enabled": True,
+            "business_context": business_context,
+            "modification_type": modification_type
+        }
+        
+        # Use the intelligent modification prompt
+        intelligent_chain = INTELLIGENT_VARIABLE_MODIFICATIONS_PROMPT | llm.with_structured_output(
+            IntelligentVariableModificationsOutput, method='function_calling'
+        )
+        
+        llm_response = intelligent_chain.invoke({
+            "primary_modifications": modification_prompt,
+            "dependency_analysis": json.dumps(dependency_graph, indent=2),
+            "raw_indicators": json.dumps([{"var_name": ri["var_name"], "name": ri["name"]} for ri in raw_indicators]),
+            "business_context": business_context
         })
-        modifications = llm_response # This is already the VariableModificationsOutput typed dict
-
-        modified_assessment_variables = list(current_assessment_variables)
-        modified_computational_variables = list(current_computational_variables)
-        project_id = state.get("project_id")
-
-        # Apply Assessment Variable Modifications
-        print("\n---Applying Assessment Variable Modifications---")
-        # Removals
-        if modifications.get("removed_assessment_variable_ids"):
-            initial_count = len(modified_assessment_variables)
-            # Filter based on the modified (project_id-prefixed) IDs
-            removed_base_ids = {f_id.split('_', 1)[-1] for f_id in modifications["removed_assessment_variable_ids"]}
-            modified_assessment_variables = [
-                var for var in modified_assessment_variables
-                if var["id"].split('_', 1)[-1] not in removed_base_ids # Compare only the base ID
-            ]
-            print(f"Removed {initial_count - len(modified_assessment_variables)} assessment variables.")
+        # print("[DEBUG] LLM Response from intelligent modification:")
+        # print(json.dumps(llm_response, indent=2, default=str))
         
-        # Updates
-        if modifications.get("updated_assessment_variables"):
-            for update_data in modifications["updated_assessment_variables"]:
-                base_id_to_update = update_data["id"] # This ID is expected to be the base ID (e.g., 'av1', not 'project_id_av1')
-                found = False
-                for i, var in enumerate(modified_assessment_variables):
-                    # Compare base ID of existing var with the ID to update
-                    if var["id"].split('_', 1)[-1] == base_id_to_update:
-                        for key, value in update_data.items():
-                            if key != "id": # Don't update the ID itself here, it's used for matching
-                                var[key] = value
-                        # Re-apply defaults just in case, particularly for var_name consistency
-                        _apply_default_variable_properties(var, is_assessment_var=True, project_id=project_id)
-                        modified_assessment_variables[i] = var
-                        print(f"Updated assessment variable: {base_id_to_update} (name: {var.get('name')})")
-                        found = True
-                        break
-                if not found:
-                    print(f"Warning: Assessment variable with base ID '{base_id_to_update}' to update not found.")
-
-        # Additions
-        if modifications.get("added_assessment_variables"):
-            for new_var_data in modifications["added_assessment_variables"]:
-                # Ensure new variable IDs are unique and apply default properties with project_id
-                # Check for existing base_id to avoid duplicates if LLM re-generates something
-                new_base_id = new_var_data.get("id")
-                is_duplicate = False
-                if new_base_id:
-                    # Check against existing *base* IDs
-                    for existing_var in modified_assessment_variables:
-                        if existing_var["id"].split('_', 1)[-1] == new_base_id:
-                            is_duplicate = True
-                            break
-                
-                if not is_duplicate:
-                    _apply_default_variable_properties(new_var_data, is_assessment_var=True, project_id=project_id)
-                    modified_assessment_variables.append(new_var_data)
-                    print(f"Added new assessment variable: {new_var_data.get('name')}")
-                else:
-                    print(f"Warning: Attempted to add duplicate assessment variable with base ID '{new_base_id}'. Skipping.")
-
-        state["assessment_variables"] = modified_assessment_variables
-
-        # Apply Computational Variable Modifications
-        print("\n---Applying Computational Variable Modifications---")
-        # Removals
-        if modifications.get("removed_computational_variable_ids"):
-            initial_count = len(modified_computational_variables)
-            removed_base_ids = {f_id.split('_', 1)[-1] for f_id in modifications["removed_computational_variable_ids"]}
-            modified_computational_variables = [
-                var for var in modified_computational_variables
-                if var["id"].split('_', 1)[-1] not in removed_base_ids # Compare only the base ID
-            ]
-            print(f"Removed {initial_count - len(modified_computational_variables)} computational variables.")
+        # Apply the intelligent modifications
+        state = apply_intelligent_modifications(state, llm_response, project_id)
         
-        # Updates
-        if modifications.get("updated_computational_variables"):
-            for update_data in modifications["updated_computational_variables"]:
-                base_id_to_update = update_data["id"]
-                found = False
-                for i, var in enumerate(modified_computational_variables):
-                    if var["id"].split('_', 1)[-1] == base_id_to_update:
-                        for key, value in update_data.items():
-                            if key != "id":
-                                var[key] = value
-                        _apply_default_variable_properties(var, is_assessment_var=False, project_id=project_id)
-                        modified_computational_variables[i] = var
-                        print(f"Updated computational variable: {base_id_to_update} (name: {var.get('name')})")
-                        found = True
-                        break
-                if not found:
-                    print(f"Warning: Computational variable with base ID '{base_id_to_update}' to update not found.")
-
-        # Additions
-        if modifications.get("added_computational_variables"):
-            for new_var_data in modifications["added_computational_variables"]:
-                new_base_id = new_var_data.get("id")
-                is_duplicate = False
-                if new_base_id:
-                    for existing_var in modified_computational_variables:
-                        if existing_var["id"].split('_', 1)[-1] == new_base_id:
-                            is_duplicate = True
-                            break
-                if not is_duplicate:
-                    _apply_default_variable_properties(new_var_data, is_assessment_var=False, project_id=project_id)
-                    modified_computational_variables.append(new_var_data)
-                    print(f"Added new computational variable: {new_var_data.get('name')}")
-                else:
-                    print(f"Warning: Attempted to add duplicate computational variable with base ID '{new_base_id}'. Skipping.")
-
-        state["computational_variables"] = modified_computational_variables
-
-        # Crucially, after modifications, re-evaluate computational variable formulas
-        # This will ensure that if an AV was removed, CVs dependent on it are flagged or updated.
-        print("\n---Re-evaluating Computational Variable Formulas based on latest AVs---")
-        latest_assessment_var_names = {var["var_name"] for var in state["assessment_variables"]}
-
-        for cv in state["computational_variables"]:
-            # Only attempt to refine if there's an existing formula to work with
-            if cv.get("formula"):
-                refined_formula = _refine_js_expression(
-                    llm_instance=llm,
-                    expression_type="formula",
-                    current_expression=cv["formula"],
-                    context_question_vars=list(latest_assessment_var_names), # Provide latest AVs as context
-                    target_entity_description=f"computational variable '{cv.get('name')}'"
-                )
-                if "// LLM FAILED" in refined_formula or "// LLM FAILED TO RESPOND" in refined_formula:
-                    state["error"] = (state.get("error") or "") + f"ERROR: Computational variable '{cv.get('name')}' has a problematic formula after AV modifications. "
-                cv["formula"] = refined_formula
-            else:
-                 # If no formula, generate a placeholder based on new AVs if relevant
-                print(f"Generating initial formula for computational variable '{cv.get('name')}'...")
-                generated_formula = _refine_js_expression(
-                    llm_instance=llm,
-                    expression_type="formula",
-                    current_expression=None, # Indicate no existing formula
-                    context_question_vars=list(latest_assessment_var_names),
-                    target_entity_description=f"computational variable '{cv.get('name')}'"
-                )
-                if "// LLM FAILED" in generated_formula or "// LLM FAILED TO RESPOND" in generated_formula:
-                    state["error"] = (state.get("error") or "") + f"ERROR: Failed to generate initial formula for computational variable '{cv.get('name')}'. "
-                cv["formula"] = generated_formula
-
-        state["error"] = None # Clear previous error if successful here
-
+        # Print only a summary of the modified state
+        print("\n--- Modified State After Modification ---")
+        print("Raw Indicators:")
+        raw_indicators_list = state.get("raw_indicators")
+        if raw_indicators_list is None:
+            raw_indicators_list = []
+        for ri in raw_indicators_list:
+            print(f"  - {ri.get('name')} (var_name: {ri.get('var_name')}, type: {ri.get('type')})")
+        print("Decision Variables:")
+        decision_variables_list = state.get("decision_variables")
+        if decision_variables_list is None:
+            decision_variables_list = []
+        for dv in decision_variables_list:
+            print(f"  - {dv.get('name')} (var_name: {dv.get('var_name')}, type: {dv.get('type')}, formula: {dv.get('formula')})")
+        if state.get("modification_reasoning"):
+            print("Reasoning:")
+            print(state.get("modification_reasoning"))
+        if state.get("error"):
+            print("Error:")
+            print(state.get("error"))
+        print("--- End of Modification ---\n")
+        
+        # print("[DEBUG] State after applying intelligent modifications:")
+        # print(json.dumps({
+        #     "raw_indicators": state.get("raw_indicators"),
+        #     "decision_variables": state.get("decision_variables"),
+        #     "modification_reasoning": state.get("modification_reasoning"),
+        #     "error": state.get("error")
+        # }, indent=2, default=str))
+        
+        print("Intelligent variable modification completed.")
+        
     except Exception as e:
-        state["error"] = (state.get("error") or "") + f"ERROR: LLM failed to generate variable modifications: {e}. "
-        print(f"Error during LLM variable modification: {e}")
+        state["error"] = (state.get("error") or "") + f"Error in intelligent variable modification: {e}"
+        print(f"Error in intelligent variable modification: {e}")
+    
+    return state
 
+def determine_modification_type(modification_prompt: str) -> str:
+    """
+    Determines whether the modification primarily affects raw indicators, decision variables, or both.
+    """
+    prompt_lower = modification_prompt.lower()
+    
+    raw_indicator_keywords = ['raw indicator', 'assessment variable', 'data point', 'input variable']
+    decision_variable_keywords = ['decision variable', 'computed variable', 'calculated variable', 'formula']
+    
+    ri_count = sum(1 for keyword in raw_indicator_keywords if keyword in prompt_lower)
+    dv_count = sum(1 for keyword in decision_variable_keywords if keyword in prompt_lower)
+    
+    if ri_count > dv_count:
+        return 'raw_indicators'
+    elif dv_count > ri_count:
+        return 'decision_variables'
+    else:
+        return 'both'
+
+def apply_intelligent_modifications(state: GraphState, llm_response: Dict, project_id: str) -> GraphState:
+    """
+    Applies the intelligent modifications returned by the LLM.
+    """
+    # print("[DEBUG] Entering apply_intelligent_modifications...")
+    # print("[DEBUG] LLM Response:")
+    # print(json.dumps(llm_response, indent=2, default=str))
+    raw_indicators = list(state.get("raw_indicators", []) or [])
+    decision_variables = list(state.get("decision_variables", []) or [])
+    
+    # Apply primary modifications
+    primary_mods = llm_response.get("primary_modifications", {})
+    # print("[DEBUG] Primary Modifications:")
+    # print(json.dumps(primary_mods, indent=2, default=str))
+    
+    # Apply compensatory modifications
+    compensatory_mods = llm_response.get("compensatory_modifications", {})
+    # print("[DEBUG] Compensatory Modifications:")
+    # print(json.dumps(compensatory_mods, indent=2, default=str))
+    
+    # Handle removed variables
+    removed_vars = llm_response.get("removed_variables", [])
+    # print(f"[DEBUG] Variables to remove: {removed_vars}")
+    for var_name in removed_vars:
+        # Remove from raw indicators
+        raw_indicators = [ri for ri in raw_indicators if ri.get('var_name') != var_name]
+        # Remove from decision variables
+        decision_variables = [dv for dv in decision_variables if dv.get('var_name') != var_name]
+    
+    # Handle new variables
+    new_vars = llm_response.get("new_variables", [])
+    # print(f"[DEBUG] New variables to add: {new_vars}")
+    for new_var in new_vars:
+        if new_var.get('formula'):  # Decision variable
+            _apply_default_variable_properties(new_var, is_raw_indicator=False, project_id=project_id)
+            decision_variables.append(new_var)
+        else:  # Raw indicator
+            _apply_default_variable_properties(new_var, is_raw_indicator=True, project_id=project_id)
+            raw_indicators.append(new_var)
+    
+    # Handle formula updates
+    updated_formulas = llm_response.get("updated_formulas", {})
+    # print(f"[DEBUG] Updated formulas: {updated_formulas}")
+    for var_name, new_formula in updated_formulas.items():
+        # Update decision variable formula
+        for dv in decision_variables:
+            if dv.get('var_name') == var_name:
+                dv['formula'] = new_formula
+                break
+    
+    # Update state
+    state["raw_indicators"] = raw_indicators
+    state["decision_variables"] = decision_variables
+    
+    # Store reasoning for transparency
+    reasoning = llm_response.get("reasoning", "")
+    if reasoning:
+        state["modification_reasoning"] = reasoning
+    # print("[DEBUG] State after all modifications:")
+    # print(json.dumps({
+    #     "raw_indicators": state.get("raw_indicators"),
+    #     "decision_variables": state.get("decision_variables"),
+    #     "modification_reasoning": state.get("modification_reasoning"),
+    #     "error": state.get("error")
+    # }, indent=2, default=str))
+    
     return state
 
 # --- Langraph Node 3: generate_questionnaire ---
 def generate_questionnaire(state: GraphState) -> GraphState:
     """
-    Generates a survey questionnaire based on the identified assessment variables.
-    Questions are grouped into sections with core and conditional questions.
+    Generates a questionnaire based on the raw indicators and decision variables.
     """
     print("\n---GENERATING QUESTIONNAIRE---")
     # Ensure state["error"] is a string at the start of this node
     state["error"] = state.get("error", "")
-    assessment_variables = state.get("assessment_variables", [])
-    computational_variables = state.get("computational_variables")
-    if computational_variables is None:
-        computational_variables = []
-    prompt_context = state.get("prompt", "")
-    project_id = state.get("project_id") # Get project_id from state
 
-    if not assessment_variables:
-        state["error"] = (state.get("error") or "") + "No assessment variables found to generate questionnaire." # Concatenate
-        print(state["error"])
+    prompt_text = state["prompt"]
+    project_id = state.get("project_id") # Get project_id from state
+    raw_indicators = state.get("raw_indicators", [])
+    decision_variables = state.get("decision_variables")
+
+    if decision_variables is None:
+        decision_variables = []
+
+    if not raw_indicators:
+        state["error"] = (state.get("error") or "") + "No raw indicators available for questionnaire generation."
+        print("No raw indicators available for questionnaire generation.")
         return state
 
-    # Extract relevant info from assessment variables for the LLM
-    # Provide var_name, name, description, and type to help LLM craft questions
-    assessment_vars_info = [
-        {
-            "var_name": var["var_name"],
-            "name": var["name"],
-            "description": var["description"],
-            "type": var["type"]
-        } for var in assessment_variables
-    ]
-    assessment_vars_json = json.dumps(assessment_vars_info, indent=2)
+    # Create context for questionnaire generation
+    prompt_context = f"User request: {prompt_text}. Generate a questionnaire to assess income for small business owners."
 
-    computational_vars_info = [
+    raw_indicators_info = [
         {
             "var_name": var["var_name"],
             "name": var["name"],
             "description": var["description"],
             "type": var["type"]
-        } for var in computational_variables
+        } for var in raw_indicators
     ]
-    computational_vars_json = json.dumps(computational_vars_info, indent=2)
+    raw_indicators_json = json.dumps(raw_indicators_info, indent=2)
+
+    decision_vars_info = [
+        {
+            "var_name": var["var_name"],
+            "name": var["name"],
+            "description": var["description"],
+            "type": var["type"]
+        } for var in decision_variables
+    ]
+    decision_vars_json = json.dumps(decision_vars_info, indent=2)
 
     # Get RAG context for questionnaire generation
     context_docs = []
@@ -594,8 +564,8 @@ def generate_questionnaire(state: GraphState) -> GraphState:
     try:
         llm_response = questionnaire_chain.invoke({
             "user_input": prompt_context,
-            "assessment_variables": assessment_vars_json,
-            "computational_variables": computational_vars_json,
+            "raw_indicators": raw_indicators_json,
+            "decision_variables": decision_vars_json,
             "context": context_docs # Pass RAG context
         })
         generated_questionnaire = llm_response
@@ -609,7 +579,7 @@ def generate_questionnaire(state: GraphState) -> GraphState:
                     if question.get('variable_name'):
                         all_existing_q_vars_set.add(question['variable_name'])
 
-        # Post-processing: Ensure IDs, default values, and intelligent JS for sec_idx, section in enumerate(generated_questionnaire.get("sections", [])):
+        # Post-processing: Ensure IDs, default values, and intelligent JS for sections and questions
         for sec_idx, section in enumerate(generated_questionnaire.get("sections", [])):
             section['order'] = section.get('order', sec_idx + 1) # Ensure order
             # Pass the main state dict directly for error tracking
@@ -638,224 +608,155 @@ def generate_questionnaire(state: GraphState) -> GraphState:
 # --- Langraph Node 4: modify_questionnaire_llm ---
 def modify_questionnaire_llm(state: GraphState) -> GraphState:
     """
-    Allows an LLM to modify the questionnaire based on a modification prompt.
-    The LLM can add, update, or remove sections and questions.
+    Enhanced questionnaire modification with intelligent analysis and reasoning.
     """
     print("\n---MODIFYING QUESTIONNAIRE USING LLM---")
-    # Ensure state["error"] is a string at the start of this node
-    state["error"] = state.get("error", "")
-
+    
     modification_prompt = state.get("modification_prompt")
-    current_questionnaire = state.get("questionnaire")
-    project_id = state.get("project_id") # Get project_id from state
-
-    if not modification_prompt or not current_questionnaire:
-        print("No modification prompt or questionnaire found. Skipping LLM questionnaire modification.")
+    if not modification_prompt:
+        print("No modification prompt provided. Skipping questionnaire modification.")
         return state
-
-    print(f"Applying questionnaire modifications based on: '{modification_prompt}'")
-
-    # Pass assessment variables to LLM for context during questionnaire modification
-    assessment_vars_info = [
-        {
-            "var_name": var["var_name"],
-            "name": var["name"],
-            "description": var["description"],
-            "type": var["type"]
-        }
-        for var in (state.get("assessment_variables") or [])
-    ]
-    assessment_vars_json = json.dumps(assessment_vars_info, indent=2)
-
-
-    modification_chain = QUESTIONNAIRE_MODIFICATIONS_PROMPT | llm.with_structured_output(QuestionnaireModificationsOutput, method='function_calling')
-
+    
+    current_questionnaire = state.get("questionnaire")
+    if not current_questionnaire:
+        state["error"] = "No questionnaire available for modification."
+        print("No questionnaire available for modification.")
+        return state
+    
+    raw_indicators = state.get("raw_indicators", []) or []
+    project_id = state.get("project_id", "") or ""
+    
     try:
-        llm_response = modification_chain.invoke({
-            "questionnaire_json": json.dumps(current_questionnaire, indent=2),
-            "modification_prompt": modification_prompt,
-            "assessment_vars_json": assessment_vars_json # Pass context
+        # Prepare business context
+        business_context = f"Financial assessment questionnaire for small business income evaluation. Project ID: {project_id}"
+        
+        # Use the intelligent modification prompt
+        intelligent_chain = INTELLIGENT_QUESTIONNAIRE_MODIFICATIONS_PROMPT | llm.with_structured_output(
+            QuestionnaireModificationsOutput, method='function_calling'
+        )
+        
+        llm_response = intelligent_chain.invoke({
+            "business_context": business_context,
+            "raw_indicators": json.dumps([{"var_name": ri["var_name"], "name": ri["name"]} for ri in raw_indicators]),
+            "current_questionnaire": json.dumps(current_questionnaire, indent=2),
+            "modification_prompt": modification_prompt
         })
-
+        
+        # Store the modification reasoning
+        if llm_response.get("reasoning"):
+            state["modification_reasoning"] = llm_response["reasoning"]
+            print("\n--- Modification Reasoning ---")
+            print(llm_response["reasoning"])
+        
         modifications = llm_response
         modified_questionnaire = current_questionnaire.copy()
         modified_sections = [dict(sec) for sec in modified_questionnaire.get("sections", [])]
         
-        # Ensure assessment_variable_calculation exists and is a dict
-        if "assessment_variable_calculation" not in modified_questionnaire or modified_questionnaire["assessment_variable_calculation"] is None:
-            modified_questionnaire["assessment_variable_calculation"] = {}
+        # Ensure raw_indicator_calculation exists and is a dict
+        if "raw_indicator_calculation" not in modified_questionnaire or modified_questionnaire["raw_indicator_calculation"] is None:
+            modified_questionnaire["raw_indicator_calculation"] = {}
         
-        modified_av_calc = modified_questionnaire["assessment_variable_calculation"].copy()
-
-
-        # Handle Section Removals (Process first to simplify updates/additions)
-        if modifications.get("removed_section_orders"):
-            initial_section_count = len(modified_sections)
-            removed_orders = set(modifications["removed_section_orders"])
-            modified_sections = [sec for sec in modified_sections if sec['order'] not in removed_orders]
-            print(f"Removed {initial_section_count - len(modified_sections)} sections.")
-            # Reorder remaining sections to maintain contiguous order
-            modified_sections.sort(key=lambda x: x['order'])
-            for i, section in enumerate(modified_sections):
-                section['order'] = i + 1
-
-        # Helper to get all question variable names in the current (modified) questionnaire structure
-        def all_existing_q_vars_in_questionnaire(sections_list) -> set:
-            q_vars = set()
-            for sec in sections_list:
-                for q_type_list in [sec.get('core_questions', []), sec.get('conditional_questions', [])]:
-                    for q in q_type_list:
-                        if q.get('variable_name'):
-                            q_vars.add(q['variable_name'])
-            return q_vars
-
-        # Handle Section Updates
-        if modifications.get("updated_sections"):
-            for updated_sec_data in modifications["updated_sections"]:
-                sec_order = updated_sec_data.get("order")
-                if sec_order:
-                    for i, section in enumerate(modified_sections):
-                        if section.get("order") == sec_order:
-                            section.update(updated_sec_data)
-                            # Pass the main state dict directly for error tracking
-                            _process_section_properties(section, all_existing_q_vars_in_questionnaire(modified_sections), state, project_id=project_id) # Pass project_id
-                            print(f"Updated section order {sec_order}: {section.get('title')}")
-                            break
-                    else:
-                        print(f"Warning: Section with order '{sec_order}' to update not found.")
-
-        # Handle Section Additions (assign unique orders)
-        if modifications.get("added_sections"):
-            for new_sec_data in modifications["added_sections"]:
-                new_order = new_sec_data.get("order")
-                if new_order is None or any(s['order'] == new_order for s in modified_sections):
-                    new_order = max([s['order'] for s in modified_sections]) + 1 if modified_sections else 1
-                new_sec_data['order'] = new_order
-                # Pass the main state dict directly for error tracking
-                _process_section_properties(new_sec_data, all_existing_q_vars_in_questionnaire(modified_sections), state, project_id=project_id) # Pass project_id
-                modified_sections.append(new_sec_data)
-                print(f"Added new section: {new_sec_data.get('title', f'Order {new_order}')}")
-            modified_sections.sort(key=lambda x: x['order']) # Re-sort after additions
-
-        # Consolidate all questions for easier lookup during removal/update/add
-        all_questions_map = {} # {id (prefixed): {question_obj, section_ref, is_core}}
-        for section in modified_sections:
-            for q_type, q_list in [('core', section['core_questions']), ('conditional', section['conditional_questions'])]:
-                for question in q_list:
-                    # Store the project-prefixed ID in the map
-                    all_questions_map[question['id']] = { 
-                        'obj': question,
-                        'section': section,
-                        'is_core': (q_type == 'core')
-                    }
-        # Also need a map for variable_name to id (prefixed) for removals
-        question_varname_to_prefixed_id_map = {q_info['obj']['variable_name']: q_id for q_id, q_info in all_questions_map.items()}
-
-
-        # Handle Question Removals by variable_name
-        if modifications.get("removed_question_variable_names"):
-            for var_name_to_remove in modifications["removed_question_variable_names"]:
-                # Get the prefixed ID from the var_name
-                prefixed_q_id_to_remove = question_varname_to_prefixed_id_map.get(var_name_to_remove)
-                if prefixed_q_id_to_remove and prefixed_q_id_to_remove in all_questions_map:
-                    q_info = all_questions_map[prefixed_q_id_to_remove]
-                    containing_section = q_info['section']
-                    if q_info['is_core']:
-                        containing_section['core_questions'] = [q for q in containing_section['core_questions'] if q['id'] != prefixed_q_id_to_remove]
-                    else:
-                        containing_section['conditional_questions'] = [q for q in containing_section['conditional_questions'] if q['id'] != prefixed_q_id_to_remove]
-                    print(f"Removed question with variable_name: {var_name_to_remove} (ID: {prefixed_q_id_to_remove})")
-                    del all_questions_map[prefixed_q_id_to_remove] # Remove from map too
-                    del question_varname_to_prefixed_id_map[var_name_to_remove] # Remove from varname map too
-                else:
-                    print(f"Warning: Question with variable_name '{var_name_to_remove}' to remove not found.")
-
-        # Handle Question Updates by id (LLM provides the base ID, we need to find the prefixed one)
-        if modifications.get("updated_questions"):
-            for updated_q_data in modifications["updated_questions"]:
-                base_q_id = updated_q_data.get("id") # LLM gives the base ID
-                if base_q_id:
-                    found = False
-                    for prefixed_q_id, q_info in all_questions_map.items():
-                        # Check if the stored prefixed_q_id ends with the base_q_id from LLM
-                        if prefixed_q_id.endswith(f"_{base_q_id}"):
-                            q_obj = q_info['obj']
-                            
-                            # Store original var_name to prevent self-collision during uniqueness check
-                            q_obj['original_variable_name_before_update'] = q_obj.get('variable_name')
-
-                            # Update all fields except 'id' as 'id' is already project-prefixed
-                            for key, value in updated_q_data.items():
-                                if key != "id":
-                                    q_obj[key] = value
-
-                            q_obj['value'] = None # Ensure value stays null after update
-                            # Re-apply properties to ensure formula/criteria refinement and project_id prefix if needed
-                            _process_question_properties(q_obj, q_info['is_core'], all_existing_q_vars_in_questionnaire(modified_sections), state, project_id=project_id)
-                            
-                            # Clean up the temporary key
-                            if 'original_variable_name_before_update' in q_obj:
-                                del q_obj['original_variable_name_before_update']
-
-                            # Update varname_to_id map if var_name changed for this question
-                            if updated_q_data.get('variable_name'):
-                                question_varname_to_prefixed_id_map[q_obj['variable_name']] = q_obj['id'] # Use the new prefixed ID
-
-                            print(f"Updated question: {base_q_id} (text: {q_obj.get('text')})")
-                            found = True
-                            break
-                    if not found:
-                        print(f"Warning: Question with base ID '{base_q_id}' to update not found.")
-
-        # Handle Question Additions
-        if modifications.get("added_questions"):
-            # Update all_existing_q_vars_in_questionnaire dynamically as new questions are added
-            existing_q_vars_for_additions = all_existing_q_vars_in_questionnaire(modified_sections)
-
-            for add_q_data in modifications["added_questions"]:
-                section_order = add_q_data.get("section_order")
-                is_core = add_q_data.get("is_core", True)
-                question_data = add_q_data.get("question")
-
-                if section_order and question_data:
-                    target_section = next((s for s in modified_sections if s['order'] == section_order), None)
-                    if target_section:
-                        # Apply properties to the new question data (this will generate its project-prefixed ID)
-                        _process_question_properties(question_data, is_core, existing_q_vars_for_additions, state, project_id=project_id) 
-                        
-                        # Check for duplicate *prefixed* IDs before appending
-                        if question_data['id'] in all_questions_map:
-                            print(f"Warning: Generated question ID '{question_data['id']}' already exists. Re-generating ID for added question.")
-                            # Re-generate a completely new ID if collision occurs
-                            question_data['id'] = f"{project_id}_{str(uuid.uuid4())}"
-                            _process_question_properties(question_data, is_core, existing_q_vars_for_additions, state, project_id=project_id) # Re-process
-
-                        if is_core:
-                            target_section['core_questions'].append(question_data)
-                        else:
-                            target_section['conditional_questions'].append(question_data)
-                        all_questions_map[question_data['id']] = { # Add to main ID map with prefixed ID
-                            'obj': question_data,
-                            'section': target_section,
-                            'is_core': is_core
-                        }
-                        question_varname_to_prefixed_id_map[question_data['variable_name']] = question_data['id'] # Add to varname map with prefixed ID
-                        print(f"Added new question '{question_data.get('text', question_data['variable_name'])}' (ID: {question_data['id']}) to section {section_order}.")
-                    else:
-                        print(f"Warning: Section with order '{section_order}' not found for adding question.")
-                else:
-                    print("Warning: Missing 'section_order' or 'question' data for question addition.")
-
+        modified_ri_calc = modified_questionnaire["raw_indicator_calculation"].copy()
+        
+        # --- Apply Section Modifications ---
+        
+        # Remove sections
+        removed_section_orders = modifications.get("removed_section_orders", [])
+        if removed_section_orders:
+            modified_sections = [sec for sec in modified_sections if sec.get("order") not in removed_section_orders]
+            print(f"Removed {len(removed_section_orders)} sections.")
+        
+        # Update existing sections
+        updated_sections = modifications.get("updated_sections", [])
+        for update in updated_sections:
+            for section in modified_sections:
+                if section.get("order") == update.get("order"):
+                    section.update(update)
+        
+        # Add new sections
+        new_sections = modifications.get("added_sections", [])
+        if new_sections:
+            # Ensure new sections have unique orders
+            existing_orders = {sec.get("order") for sec in modified_sections}
+            for new_sec in new_sections:
+                while new_sec.get("order") in existing_orders:
+                    new_sec["order"] = new_sec.get("order", 1) + 1
+                modified_sections.append(new_sec)
+                existing_orders.add(new_sec.get("order"))
+            print(f"Added {len(new_sections)} new sections.")
+        
+        # --- Apply Question Modifications ---
+        
+        # Remove questions
+        removed_q_vars = modifications.get("removed_question_variable_names", [])
+        if removed_q_vars:
+            for section in modified_sections:
+                for qtype in ["core_questions", "conditional_questions"]:
+                    original_questions = section.get(qtype, [])
+                    filtered_questions = [q for q in original_questions if q.get("variable_name") not in removed_q_vars]
+                    section[qtype] = filtered_questions
+            print(f"Removed {len(removed_q_vars)} questions by variable_name.")
+        
+        # Update existing questions
+        updated_questions = modifications.get("updated_questions", [])
+        for update in updated_questions:
+            for section in modified_sections:
+                for qtype in ["core_questions", "conditional_questions"]:
+                    for question in section.get(qtype, []):
+                        if question.get("variable_name") == update.get("variable_name"):
+                            question.update(update)
+        
+        # Add new questions
+        added_questions = modifications.get("added_questions", [])
+        if added_questions:
+            # Track existing variable names to prevent duplicates
+            existing_var_names = set()
+            for section in modified_sections:
+                for qtype in ["core_questions", "conditional_questions"]:
+                    for q in section.get(qtype, []):
+                        existing_var_names.add(q.get("variable_name"))
+            
+            for new_q in added_questions:
+                target_section = None
+                section_order = new_q.get("section_order")
+                is_core = new_q.get("is_core", True)
+                
+                # Find the target section
+                for section in modified_sections:
+                    if section.get("order") == section_order:
+                        target_section = section
+                        break
+                
+                if target_section:
+                    question = new_q.get("question", {})
+                    if question.get("variable_name") not in existing_var_names:
+                        _process_question_properties(question, is_core, existing_var_names, state, project_id=project_id)
+                        qtype = "core_questions" if is_core else "conditional_questions"
+                        if qtype not in target_section:
+                            target_section[qtype] = []
+                        target_section[qtype].append(question)
+                        existing_var_names.add(question.get("variable_name"))
+            print(f"Added {len(added_questions)} new questions.")
+        
+        # Update the questionnaire with modified sections
         modified_questionnaire["sections"] = modified_sections
         state["questionnaire"] = modified_questionnaire
-        print("\n---LLM Questionnaire Modification Complete.---")
-
+        
+        print("\n--- Questionnaire Modification Summary ---")
+        print(f"Sections removed: {len(removed_section_orders)}")
+        print(f"Sections updated: {len(updated_sections)}")
+        print(f"Sections added: {len(new_sections)}")
+        print(f"Questions removed: {len(removed_q_vars)}")
+        print(f"Questions updated: {len(updated_questions)}")
+        print(f"Questions added: {len(added_questions)}")
+        if state.get("modification_reasoning"):
+            print("\nReasoning:")
+            print(state.get("modification_reasoning"))
+        
     except Exception as e:
-        state["error"] = (state.get("error") or "") + f"Error modifying questionnaire with LLM: {e}" # Concatenate
-        print(f"Error modifying questionnaire with LLM: {e}")
-        # Do NOT return state here, allow processing to continue to next node
-        return state
-
+        state["error"] = (state.get("error") or "") + f"Error modifying questionnaire: {e}"
+        print(f"Error modifying questionnaire: {e}")
+    
     return state
 
 
@@ -902,88 +803,89 @@ def _upsert_single_item(table_name: str, item: Dict[str, Any], headers: Dict[str
 # --- Langraph Node 5: analyze_questionnaire_impact ---
 def analyze_questionnaire_impact(state: GraphState) -> GraphState:
     """
-    Analyzes the questionnaire to ensure all assessment variables can be calculated.
+    Analyzes the questionnaire to ensure all raw indicators can be calculated.
     If variables are uncalculable, it attempts to generate new questions to cover them.
     """
     print("\n---ANALYZING QUESTIONNAIRE IMPACT---")
     # Ensure state["error"] is a string at the start of this node
     state["error"] = state.get("error", "")
 
-    # Ensure assessment_variables is always a list at the start of this node
-    current_assessment_variables = state.get("assessment_variables")
-    if current_assessment_variables is None:
-        current_assessment_variables = []
-        state["assessment_variables"] = current_assessment_variables # Update state if it was None
+    # Ensure raw_indicators is always a list at the start of this node
+    current_raw_indicators = state.get("raw_indicators")
+    if current_raw_indicators is None:
+        current_raw_indicators = []
+        state["raw_indicators"] = current_raw_indicators # Update state if it was None
 
-    assessment_variables = current_assessment_variables # Use the guaranteed list from now on
+    raw_indicators = current_raw_indicators # Use the guaranteed list from now on
     questionnaire = state.get("questionnaire") or {}
     sections = questionnaire.get("sections", [])
     
-    # Initialize assessment_variable_calculation if it's None or missing
-    if "assessment_variable_calculation" not in questionnaire or questionnaire["assessment_variable_calculation"] is None:
-        questionnaire["assessment_variable_calculation"] = {}
-    av_calculation_map = questionnaire["assessment_variable_calculation"]
+    # Initialize raw_indicator_calculation if it's None or missing
+    if "raw_indicator_calculation" not in questionnaire or questionnaire["raw_indicator_calculation"] is None:
+        questionnaire["raw_indicator_calculation"] = {}
+    ri_calculation_map = questionnaire["raw_indicator_calculation"]
 
 
-    if not assessment_variables:
-        print("No assessment variables to analyze impact.")
+    if not raw_indicators:
+        print("No raw indicators to analyze impact.")
         return state
     if not sections:
         print("No questionnaire sections to analyze impact.")
         return state
 
-    # Create a quick lookup for assessment variable objects by var_name
-    av_varname_map = {av['var_name']: av for av in assessment_variables}
+    # Create a quick lookup for raw indicator objects by var_name
+    ri_varname_map = {ri['var_name']: ri for ri in raw_indicators}
 
-    # Track which assessment variables are explicitly covered by assessment_variables list in questions
-    explicitly_covered_avs = set()
+    # Track which raw indicators are explicitly covered by raw_indicators list in questions
+    explicitly_covered_ris = set()
     all_question_vars = set()
-    # New set to track AVs referenced by questions but not existing in state['assessment_variables']
-    referenced_but_missing_avs = set() 
+    # New set to track RIs referenced by questions but not existing in state['raw_indicators']
+    referenced_but_missing_ris = set() 
 
     for section in sections:
         for q_list in [section.get('core_questions', []), section.get('conditional_questions', [])]:
             for question in q_list:
                 all_question_vars.add(question.get('variable_name'))
-                for av_name in question.get('assessment_variables', []):
-                    explicitly_covered_avs.add(av_name)
-                    # Check if this referenced AV exists in our master list
-                    if av_name not in av_varname_map:
-                        referenced_but_missing_avs.add(av_name)
+                for ri_name in question.get('raw_indicators', []):
+                    explicitly_covered_ris.add(ri_name)
+                    # Check if this referenced RI exists in our master list
+                    if ri_name not in ri_varname_map:
+                        referenced_but_missing_ris.add(ri_name)
 
-    # All assessment variables that are supposed to exist based on `state['assessment_variables']`
-    existing_assessment_var_names_in_state = {av['var_name'] for av in assessment_variables}
+    # All raw indicators that are supposed to exist based on `state['raw_indicators']`
+    existing_raw_indicator_names_in_state = {ri['var_name'] for ri in raw_indicators}
 
-    # Combine uncovered AVs that are *expected* to exist but aren't explicitly covered by questions
-    uncovered_assessment_vars_by_question_impact = [
-        var for var in assessment_variables
-        if var["var_name"] not in explicitly_covered_avs
+    # Combine uncovered RIs that are *expected* to exist but aren't explicitly covered by questions
+    uncovered_raw_indicators_by_question_impact = [
+        var for var in raw_indicators
+        if var["var_name"] not in explicitly_covered_ris
     ]
 
-    # Add placeholder AVs for those referenced by questions but not existing in state
-    if referenced_but_missing_avs:
-        print(f"Detected questions referencing missing assessment variables: {', '.join(referenced_but_missing_avs)}")
-        for missing_av_name in referenced_but_missing_avs:
-            if missing_av_name not in existing_assessment_var_names_in_state: # Only add if truly missing
-                print(f"Adding placeholder assessment variable for: {missing_av_name}")
-                placeholder_av = {
+    # Add placeholder RIs for those referenced by questions but not existing in state
+    if referenced_but_missing_ris:
+        print(f"Detected questions referencing missing raw indicators: {', '.join(referenced_but_missing_ris)}")
+        for missing_ri_name in referenced_but_missing_ris:
+            if missing_ri_name not in existing_raw_indicator_names_in_state: # Only add if truly missing
+                print(f"Adding placeholder raw indicator for: {missing_ri_name}")
+                placeholder_ri = {
                     "id": str(uuid.uuid4()),
-                    "name": missing_av_name.replace('_', ' ').title(),
-                    "var_name": missing_av_name,
-                    "priority": 5, # Low priority for auto-added
-                    "description": f"Placeholder for {missing_av_name} referenced by a question but not initially defined.",
+                    "name": missing_ri_name.replace('_', ' ').title(),
+                    "var_name": missing_ri_name,
+                    "impact_score": 50, # Low impact_score for auto-added
+                    "priority_rationale": "Auto-generated placeholder for missing raw indicator",
+                    "description": f"Placeholder for {missing_ri_name} referenced by a question but not initially defined.",
                     "formula": None,
                     "type": "text", # Default type
                     "value": None,
                     "project_id": state.get("project_id") # Add project_id
                 }
                 # Use the already guaranteed-to-be-list variable
-                current_assessment_variables.append(placeholder_av) 
-                av_varname_map[missing_av_name] = placeholder_av # Update map for current run
-                existing_assessment_var_names_in_state.add(missing_av_name) # Add to set to prevent re-adding
+                current_raw_indicators.append(placeholder_ri) 
+                ri_varname_map[missing_ri_name] = placeholder_ri # Update map for current run
+                existing_raw_indicator_names_in_state.add(missing_ri_name) # Add to set to prevent re-adding
 
 
-    # Check for assessment variables whose calculation formula uses non-existent question variables
+    # Check for raw indicators whose calculation formula uses non-existent question variables
     problemmatic_calculation_vars = []
     # Identify all question variable names that currently exist in the questionnaire
     existing_question_var_names = set()
@@ -992,60 +894,60 @@ def analyze_questionnaire_impact(state: GraphState) -> GraphState:
             for question in q_list:
                 existing_question_var_names.add(question.get('variable_name'))
 
-    for av_var_name, formula in av_calculation_map.items():
-        if av_var_name in av_varname_map: # Only check if the AV itself exists
+    for ri_var_name, formula in ri_calculation_map.items():
+        if ri_var_name in ri_varname_map: # Only check if the RI itself exists
             # Find all 'q_' type variables in the formula
             import re
             formula_question_vars = re.findall(r'\b(q_[a-zA-Z0-9_]+)\b', formula)
             for fq_var in formula_question_vars:
                 if fq_var not in existing_question_var_names:
-                    problemmatic_calculation_vars.append(av_var_name)
-                    print(f"Warning: Assessment variable '{av_var_name}' formula references missing question variable '{fq_var}'.")
-                    break # Only need to flag once per AV
+                    problemmatic_calculation_vars.append(ri_var_name)
+                    print(f"Warning: Raw indicator '{ri_var_name}' formula references missing question variable '{fq_var}'.")
+                    break # Only need to flag once per RI
 
-    # Combine all unique assessment variables that need attention
-    # This list will now include any newly added placeholder AVs if they were referenced by questions
-    # and also existing AVs that are not covered or have problematic formulas.
+    # Combine all unique raw indicators that need attention
+    # This list will now include any newly added placeholder RIs if they were referenced by questions
+    # and also existing RIs that are not covered or have problematic formulas.
     vars_to_address = list(set(
-        [var["var_name"] for var in uncovered_assessment_vars_by_question_impact if var["var_name"] in existing_assessment_var_names_in_state] +
+        [var["var_name"] for var in uncovered_raw_indicators_by_question_impact if var["var_name"] in existing_raw_indicator_names_in_state] +
         problemmatic_calculation_vars +
-        list(referenced_but_missing_avs) # Include the newly created placeholder AVs here
+        list(referenced_but_missing_ris) # Include the newly created placeholder RIs here
     ))
 
     if vars_to_address:
-        state["error"] = (state.get("error") or "") + "Warning: Some assessment variables are not fully covered by questionnaire questions or have problematic calculations." # Concatenate
+        state["error"] = (state.get("error") or "") + "Warning: Some raw indicators are not fully covered by questionnaire questions or have problematic calculations." # Concatenate
         print(state["error"])
-        print(f"Assessment variables needing attention: {', '.join(vars_to_address)}")
+        print(f"Raw indicators needing attention: {', '.join(vars_to_address)}")
 
         # Attempt to generate new questions for uncovered/problemmatic variables
-        print("\n---Attempting to generate new questions for affected assessment variables---")
-        # Filter uncovered_vars_info to include newly added placeholder AVs that need questions
-        uncovered_vars_info = [av_varname_map[var_name] for var_name in vars_to_address if var_name in av_varname_map]
+        print("\n---Attempting to generate new questions for affected raw indicators---")
+        # Filter uncovered_vars_info to include newly added placeholder RIs that need questions
+        uncovered_vars_info = [ri_varname_map[var_name] for var_name in vars_to_address if var_name in ri_varname_map]
 
         if uncovered_vars_info:
             remediation_prompt_template = ChatPromptTemplate.from_messages( # Re-defining here for specific remediation context
                 [
                     ("system",
                      "You are an AI assistant tasked with generating missing survey questions. "
-                     "A questionnaire has been modified, and some assessment variables are no longer "
+                     "A questionnaire has been modified, and some raw indicators are no longer "
                      "adequately captured or their calculation formulas are invalid due to missing question data. "
                      "Your goal is to suggest new, simple, and direct questions for the specified "
-                     "assessment variables. "
+                     "raw indicators. "
                      "Output should be a JSON object containing an 'added_questions' array of Question objects, "
-                     "and an 'updated_assessment_variable_calculation' dictionary. "
+                     "and an 'updated_raw_indicator_calculation' dictionary. "
                      "For each question, ensure it has 'id' (unique string), 'text' (simple, clear language), "
                      "'type' (e.g., 'int', 'float', 'text'), 'variable_name' (unique snake_case), "
                      "'triggering_criteria' (null if not conditional), "
-                     "and 'assessment_variables' (list of `var_name`s it helps capture). "
+                     "and 'raw_indicators' (list of `var_name`s it helps capture). "
                      "**Also include a 'formula' for each added question, describing how its raw answer is interpreted or transformed to contribute.**"
-                     "The 'updated_assessment_variable_calculation' mapping should provide new or updated "
+                     "The 'updated_raw_indicator_calculation' mapping should provide new or updated "
                      "JavaScript formulas using the `variable_name`s of the questions you generate. "
                      "You should suggest adding these new questions to the most relevant or first mandatory section if possible."
                     ),
                     ("human",
-                     "The following assessment variables need to be captured by new questions (and potentially their calculation mapping updated):\n{uncovered_vars_json}\n\n"
+                     "The following raw indicators need to be captured by new questions (and potentially their calculation mapping updated):\n{uncovered_vars_json}\n\n"
                      "Current questionnaire context (for appropriate placement of new questions and formula updates):\n{questionnaire_json}\n\n"
-                     "Please generate suitable new questions for these variables and suggest updates to the assessment_variable_calculation."
+                     "Please generate suitable new questions for these variables and suggest updates to the raw_indicator_calculation."
                     )
                 ]
             )
@@ -1067,11 +969,11 @@ def analyze_questionnaire_impact(state: GraphState) -> GraphState:
                     return state # This is a critical failure, stop this node.
 
                 new_questions_data = remediation_response_raw.get("added_questions", [])
-                updated_calc_map = remediation_response_raw.get("updated_assessment_variable_calculation", {})
+                updated_calc_map = remediation_response_raw.get("updated_raw_indicator_calculation", {})
 
                 # Ensure updated_calc_map is indeed a dict before trying to update
                 if not isinstance(updated_calc_map, dict):
-                    print(f"ERROR: Expected updated_assessment_variable_calculation to be a dict, but got {type(updated_calc_map)}: {updated_calc_map}")
+                    print(f"ERROR: Expected updated_raw_indicator_calculation to be a dict, but got {type(updated_calc_map)}: {updated_calc_map}")
                     # If it's not a dict, default it to an empty dict to prevent further errors
                     updated_calc_map = {}
                     state["error"] = (state.get("error") or "") + "Warning: LLM remediation generated invalid calculation map. Defaulting to empty."
@@ -1089,41 +991,28 @@ def analyze_questionnaire_impact(state: GraphState) -> GraphState:
                             break
                     if not target_section and sections: # If no mandatory core, try first existing section
                         target_section = sections[0]
-                    
-                    if not target_section: # If still no section, create a default one
-                        print("No suitable existing section found for remediation. Creating a new 'Remediation' section.")
-                        target_section = {
-                            "title": "Remediation Questions",
-                            "description": "Questions added to cover previously uncaptured assessment variables.",
-                            "order": max([s['order'] for s in sections]) + 1 if sections else 1,
-                            "is_mandatory": True,
-                            "rationale": "Automatically generated to ensure data completeness.",
-                            "core_questions": [],
-                            "conditional_questions": [],
-                            "triggering_criteria": None,
-                            "data_validation": "return true;",
-                            "project_id": state.get("project_id") # Add project_id
-                        }
-                        questionnaire["sections"].append(target_section)
-                        questionnaire["sections"].sort(key=lambda x: x['order']) # Re-sort sections
+                    if target_section:
+                        # Prevent duplicate variable_name in the section
+                        existing_var_names = {q['variable_name'] for q in target_section.get('core_questions', [])}
+                        added_count = 0
+                        for new_q_data in new_questions_data:
+                            if new_q_data['variable_name'] not in existing_var_names:
+                                _process_question_properties(new_q_data, True, existing_var_names, state, project_id=state.get("project_id"))
+                                target_section['core_questions'].append(new_q_data)
+                                existing_var_names.add(new_q_data['variable_name'])
+                                added_count += 1
+                            else:
+                                print(f"Warning: Skipped adding duplicate question with variable_name '{new_q_data['variable_name']}' to section '{target_section.get('title', target_section['order'])}'.")
+                        print(f"Adding {added_count} remediation questions to section: {target_section.get('title', target_section['order'])}")
 
-                    print(f"Adding {len(new_questions_data)} remediation questions to section: {target_section.get('title', target_section['order'])}")
-                    # Consolidate all existing question variable names to ensure uniqueness for new ones
-                    existing_q_var_names_after_remediation_add = all_question_vars.copy() # Use a copy of the set
-
-                    for new_q_data in new_questions_data:
-                        # Pass the main state dict directly for error tracking
-                        _process_question_properties(new_q_data, True, existing_q_var_names_after_remediation_add, state, project_id=state.get("project_id")) # Pass project_id
-                        target_section['core_questions'].append(new_q_data)
-                
-                # Update assessment_variable_calculation map
+                # Update raw_indicator_calculation map
                 if updated_calc_map:
-                    questionnaire["assessment_variable_calculation"].update(updated_calc_map)
-                    print("Updated assessment variable calculation map with new entries.")
+                    questionnaire["raw_indicator_calculation"].update(updated_calc_map)
+                    print("Updated raw_indicator_calculation map with new entries.")
 
                 state["questionnaire"] = questionnaire # Update state with modified questionnaire
                 # Update error message to indicate remediation was attempted
-                state["error"] = (state.get("error") or "") + f"Warning: Some assessment variables were flagged and an attempt was made to add questions. Review updated questionnaire and calculation map." # Concatenate
+                state["error"] = (state.get("error") or "") + f"Warning: Some raw indicators were flagged and an attempt was made to add questions. Review updated questionnaire and calculation map."
                 print("\n---Remediation complete. Please review the updated questionnaire and calculation map.---")
 
             except Exception as e:
@@ -1141,7 +1030,7 @@ def analyze_questionnaire_impact(state: GraphState) -> GraphState:
 # --- Langraph Node 6: write_to_supabase ---
 def write_to_supabase(state: GraphState) -> GraphState:
     """
-    Writes the generated (and potentially LLM-modified) assessment and computational variables
+    Writes the generated (and potentially LLM-modified) raw indicators and decision variables
     and questionnaire questions to your Supabase tables. This function now performs
     upsert operations (update if exists, insert if new) for individual records.
     """
@@ -1156,36 +1045,36 @@ def write_to_supabase(state: GraphState) -> GraphState:
     }
     error_occurred = False
 
-    # --- Write Assessment Variables ---
-    assessment_vars_to_write = state.get("assessment_variables")
-    if assessment_vars_to_write:
-        print(f"Attempting to upsert {len(assessment_vars_to_write)} assessment variables...")
-        for var in assessment_vars_to_write:
+    # --- Write Raw Indicators ---
+    raw_indicators_to_write = state.get("raw_indicators")
+    if raw_indicators_to_write:
+        print(f"Attempting to upsert {len(raw_indicators_to_write)} raw indicators...")
+        for var in raw_indicators_to_write:
             # The 'id' in 'var' is already project-prefixed due to _apply_default_variable_properties
             # Ensure project_id is correctly set in the item payload
             var["project_id"] = state.get("project_id")
-            # Using 'asessment_variables' (single 's') as per user's confirmation
-            if not _upsert_single_item("asessment_variables", var, headers): 
+            # Using 'raw_indicators' as the table name
+            if not _upsert_single_item("raw_indicators", var, headers): 
                 error_occurred = True
     else:
-        print("No assessment variables found in state to write to Supabase.")
+        print("No raw indicators found in state to write to Supabase.")
 
-    # --- Write Computational Variables ---
-    computational_vars_to_write = state.get("computational_variables")
-    if computational_vars_to_write:
-        print(f"Attempting to upsert {len(computational_vars_to_write)} computational variables...")
-        for var in computational_vars_to_write:
+    # --- Write Decision Variables ---
+    decision_vars_to_write = state.get("decision_variables")
+    if decision_vars_to_write:
+        print(f"Attempting to upsert {len(decision_vars_to_write)} decision variables...")
+        for var in decision_vars_to_write:
             # The 'id' in 'var' is already project-prefixed
             var["project_id"] = state.get("project_id")
-            if not _upsert_single_item("computational_variables", var, headers):
+            if not _upsert_single_item("decision_variables", var, headers):
                 error_occurred = True
     else:
-        print("No computational variables found in state to write to Supabase.")
+        print("No decision variables found in state to write to Supabase.")
 
     # --- Write Questionnaire Questions to 'questions' table ---
     questionnaire_data = state.get("questionnaire")
-    # For mapping AVs to ID/Name, ensure we use the project-prefixed IDs from the current state
-    assessment_variables_map = {av['var_name']: av for av in (state.get("assessment_variables") or [])}
+    # For mapping RIs to ID/Name, ensure we use the project-prefixed IDs from the current state
+    raw_indicators_map = {ri['var_name']: ri for ri in (state.get("raw_indicators") or [])}
 
     questions_to_supabase = []
     if questionnaire_data and questionnaire_data.get("sections"):
@@ -1200,19 +1089,19 @@ def write_to_supabase(state: GraphState) -> GraphState:
                     # Individual question's conditional logic is handled by question_triggering_criteria.
                     is_q_mandatory_in_db = section.get('is_mandatory', False)
 
-                    impacted_av_details = []
-                    # The `av_var_name` here is the *base* variable name (e.g., 'avg_monthly_income') from the question's assessment_variables list.
-                    # We need to find the corresponding assessment variable object in our `state["assessment_variables"]` which now has project-prefixed IDs.
-                    # The `assessment_variables_map` already helps us find the full AV object by its `var_name`.
-                    for av_var_name in question.get('assessment_variables', []):
-                        av_detail = assessment_variables_map.get(av_var_name)
-                        if av_detail:
-                            impacted_av_details.append({
-                                "id": av_detail["id"], # This will now be the project-prefixed ID
-                                "name": av_detail["name"]
+                    impacted_ri_details = []
+                    # The `ri_var_name` here is the *base* variable name (e.g., 'avg_monthly_income') from the question's raw_indicators list.
+                    # We need to find the corresponding raw indicator object in our `state["raw_indicators"]` which now has project-prefixed IDs.
+                    # The `raw_indicators_map` already helps us find the full RI object by its `var_name`.
+                    for ri_var_name in question.get('raw_indicators', []):
+                        ri_detail = raw_indicators_map.get(ri_var_name)
+                        if ri_detail:
+                            impacted_ri_details.append({
+                                "id": ri_detail["id"], # This will now be the project-prefixed ID
+                                "name": ri_detail["name"]
                             })
                         else:
-                            print(f"Warning: Assessment variable '{av_var_name}' not found for question '{question.get('variable_name')}' during Supabase write.")
+                            print(f"Warning: Raw indicator '{ri_var_name}' not found for question '{question.get('variable_name')}' during Supabase write.")
 
                     question_entry = {
                         "id": question["id"], # This is already project-prefixed
@@ -1224,7 +1113,7 @@ def write_to_supabase(state: GraphState) -> GraphState:
                         "is_mandatory": is_q_mandatory_in_db, # Updated as per user's clarification
                         "section_triggering_criteria": section["triggering_criteria"],
                         "question_var_name": question["variable_name"],
-                        "impacted_assessment_variables": json.dumps(impacted_av_details), # Store as JSON string for jsonb field
+                        "impacted_raw_indicators": json.dumps(impacted_ri_details), # Store as JSON string for jsonb field
                         "question_triggering_criteria": question["triggering_criteria"],
                         "is_conditional": question.get("is_conditional", False), # New: Add is_conditional field
                         "formula": question.get("formula") # Include the new formula field
@@ -1244,3 +1133,223 @@ def write_to_supabase(state: GraphState) -> GraphState:
         state["error"] = None
 
     return state
+
+# --- NEW: Dependency Analysis Functions ---
+
+def analyze_variable_dependencies(raw_indicators: List[Dict], decision_variables: List[Dict]) -> Dict[str, Any]:
+    """
+    Analyzes dependencies between raw indicators and decision variables.
+    Returns a comprehensive dependency graph with impact analysis.
+    """
+    print("---ANALYZING VARIABLE DEPENDENCIES---")
+    
+    # Extract raw indicator names
+    raw_indicator_names = [ri['var_name'] for ri in raw_indicators]
+    
+    # Analyze decision variable dependencies
+    dependency_info_list = []
+    breaking_changes = []
+    enabling_changes = []
+    required_updates = []
+    
+    for dv in decision_variables:
+        formula = dv.get('formula', '')
+        var_name = dv.get('var_name', '')
+        
+        # Parse formula to find raw indicator references
+        dependencies = parse_formula_dependencies(formula, raw_indicator_names)
+        
+        # Determine impact level
+        impact_level = determine_impact_level(dependencies, formula)
+        
+        dependency_info = {
+            "variable_name": var_name,
+            "depends_on": dependencies,
+            "formula": formula,
+            "impact_level": impact_level
+        }
+        dependency_info_list.append(dependency_info)
+        
+        # Check for potential issues
+        if not dependencies and formula.strip():
+            breaking_changes.append(var_name)
+        elif len(dependencies) == 1 and impact_level == 'critical':
+            required_updates.append(var_name)
+    
+    # Find orphaned raw indicators (not used by any decision variable)
+    used_raw_indicators = set()
+    for dep_info in dependency_info_list:
+        used_raw_indicators.update(dep_info['depends_on'])
+    
+    orphaned_variables = [ri for ri in raw_indicator_names if ri not in used_raw_indicators]
+    
+    # Identify potential new decision variables
+    enabling_changes = identify_potential_new_decision_variables(raw_indicators, decision_variables)
+    
+    impact_analysis = {
+        "breaking_changes": breaking_changes,
+        "enabling_changes": enabling_changes,
+        "required_updates": required_updates,
+        "orphaned_variables": orphaned_variables
+    }
+    
+    dependency_graph = {
+        "raw_indicators": raw_indicator_names,
+        "decision_variables": dependency_info_list,
+        "impact_analysis": impact_analysis
+    }
+    
+    print(f"Dependency analysis complete. Found {len(dependency_info_list)} decision variables with dependencies.")
+    return dependency_graph
+
+def parse_formula_dependencies(formula: str, raw_indicator_names: List[str]) -> List[str]:
+    """
+    Parses a JavaScript formula to extract raw indicator dependencies.
+    """
+    if not formula or not formula.strip():
+        return []
+    
+    dependencies = []
+    
+    # Look for exact matches with raw indicator names
+    for ri_name in raw_indicator_names:
+        # Use word boundaries to avoid partial matches
+        pattern = r'\b' + re.escape(ri_name) + r'\b'
+        if re.search(pattern, formula):
+            dependencies.append(ri_name)
+    
+    # Also look for common patterns like q_variable_name
+    q_pattern = r'\bq_([a-zA-Z_][a-zA-Z0-9_]*)\b'
+    q_matches = re.findall(q_pattern, formula)
+    for match in q_matches:
+        if match in raw_indicator_names:
+            dependencies.append(match)
+    
+    return list(set(dependencies))  # Remove duplicates
+
+def determine_impact_level(dependencies: List[str], formula: str) -> str:
+    """
+    Determines the impact level of dependencies on a decision variable.
+    """
+    if not dependencies:
+        return 'critical' if formula.strip() else 'low'
+    
+    if len(dependencies) == 1:
+        # Check if the formula heavily relies on this single dependency
+        if re.search(r'\b(return|if|while|for)\b', formula):
+            return 'critical'
+        else:
+            return 'moderate'
+    else:
+        return 'moderate'
+
+def identify_potential_new_decision_variables(raw_indicators: List[Dict], decision_variables: List[Dict]) -> List[str]:
+    """
+    Identifies potential new decision variables that could be created.
+    """
+    existing_dv_names = {dv['var_name'] for dv in decision_variables}
+    potential_new = []
+    
+    # Look for patterns in raw indicators that suggest new decision variables
+    ri_names = [ri['var_name'] for ri in raw_indicators]
+    
+    # Check for expense-related indicators that could form total expenses
+    expense_indicators = [ri for ri in ri_names if 'expense' in ri.lower() or 'cost' in ri.lower()]
+    if len(expense_indicators) > 1 and 'total_expenses' not in existing_dv_names:
+        potential_new.append('total_expenses')
+    
+    # Check for income-related indicators that could form total income
+    income_indicators = [ri for ri in ri_names if 'income' in ri.lower() or 'revenue' in ri.lower() or 'sales' in ri.lower()]
+    if len(income_indicators) > 1 and 'total_income' not in existing_dv_names:
+        potential_new.append('total_income')
+    
+    # Check for ratio indicators
+    if any('income' in ri.lower() for ri in ri_names) and any('expense' in ri.lower() for ri in ri_names):
+        if 'income_expense_ratio' not in existing_dv_names:
+            potential_new.append('income_expense_ratio')
+    
+    return potential_new
+
+# --- NEW: Intelligent Variable Synchronization Functions ---
+
+def analyze_variable_dependencies_node(state: GraphState) -> GraphState:
+    """
+    Langraph node for analyzing variable dependencies.
+    """
+    print("---ANALYZING VARIABLE DEPENDENCIES NODE---")
+    
+    raw_indicators = state.get("raw_indicators", []) or []
+    decision_variables = state.get("decision_variables", []) or []
+    
+    if not raw_indicators and not decision_variables:
+        print("No variables to analyze dependencies for.")
+        return state
+    
+    try:
+        dependency_graph = analyze_variable_dependencies(raw_indicators, decision_variables)
+        state["dependency_graph"] = cast(DependencyGraph, dependency_graph)  # type: ignore
+        print("Dependency analysis completed and stored in state.")
+    except Exception as e:
+        state["error"] = (state.get("error") or "") + f"Error analyzing dependencies: {e}"
+        print(f"Error analyzing dependencies: {e}")
+    
+    return state
+
+def synchronize_variables(state: GraphState) -> GraphState:
+    """
+    Post-modification synchronization to ensure consistency.
+    """
+    print("---SYNCHRONIZING VARIABLES---")
+    
+    raw_indicators = state.get("raw_indicators", []) or []
+    decision_variables = state.get("decision_variables", []) or []
+    
+    if not raw_indicators and not decision_variables:
+        return state
+    
+    try:
+        # Re-analyze dependencies after modifications
+        dependency_graph = analyze_variable_dependencies(raw_indicators, decision_variables)
+        state["dependency_graph"] = cast(DependencyGraph, dependency_graph)  # type: ignore
+        
+        # Check for consistency issues
+        impact_analysis = dependency_graph.get("impact_analysis", {})
+        breaking_changes = impact_analysis.get("breaking_changes", [])
+        orphaned_variables = impact_analysis.get("orphaned_variables", [])
+        
+        if breaking_changes or orphaned_variables:
+            print(f"Warning: Found {len(breaking_changes)} breaking changes and {len(orphaned_variables)} orphaned variables.")
+            state["error"] = (state.get("error") or "") + f"Warning: {len(breaking_changes)} breaking changes and {len(orphaned_variables)} orphaned variables detected after synchronization."
+        
+        print("Variable synchronization completed.")
+        
+    except Exception as e:
+        state["error"] = (state.get("error") or "") + f"Error in variable synchronization: {e}"
+        print(f"Error in variable synchronization: {e}")
+    
+    return state
+
+# --- Supabase fetch utility ---
+def fetch_supabase_tables() -> Dict[str, Any]:
+    """
+    Fetch all rows from the three Supabase tables: raw_indicators, decision_variables, questionnaire.
+    Returns a dict with keys 'raw_indicators', 'decision_variables', 'questionnaire'.
+    """
+    import requests
+    headers = {
+        "apikey": SUPABASE_API_KEY,
+        "Authorization": f"Bearer {SUPABASE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    base_url = SUPABASE_URL
+    result = {}
+    for table in ["raw_indicators", "decision_variables", "questionnaire"]:
+        url = f"{base_url}/{table}?select=*"
+        try:
+            resp = requests.get(url, headers=headers)
+            resp.raise_for_status()
+            result[table] = resp.json()
+        except Exception as e:
+            print(f"Error fetching {table} from Supabase: {e}")
+            result[table] = []
+    return result

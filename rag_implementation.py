@@ -1,7 +1,7 @@
 import pandas as pd
 import os
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.vectorstores import Chroma
+from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.runnable import RunnablePassthrough
@@ -96,12 +96,17 @@ def get_rag_chain_and_retriever():
     Initializes and returns both the RAG chain (for direct querying)
     and the retriever (for fetching documents) from the vector store.
     """
-    csv_file_path = "income_assesment/data_store/filtered_flow_data.csv"
+    # Get the directory where this file is located
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_file_path = os.path.join(current_dir, "data_store", "filtered_flow_data.csv")
+    
     documents = load_csv_data(csv_file_path)
     if not documents:
         raise ValueError(f"Could not load documents from {csv_file_path}. Ensure file exists and is accessible.")
     
-    vectorstore = setup_vector_store(documents)
+    # Use a relative path for the persist directory from the current file location
+    persist_dir = os.path.join(current_dir, "chroma_db")
+    vectorstore = setup_vector_store(documents, persist_directory=persist_dir)
     
     # The retriever for fetching relevant documents
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})

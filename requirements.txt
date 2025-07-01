@@ -1,8 +1,9 @@
-fastapi
-uvicorn
-pydantic
-langchain-openai
-langchain-core
-langgraph
-python-dotenv
-requests
+fastapi==0.109.0
+uvicorn==0.27.0
+pydantic==2.6.0
+python-dotenv==1.0.0
+langchain==0.1.0
+langchain-openai==0.0.5
+langgraph==0.0.15
+chromadb==0.4.22
+supabase==2.3.4 
