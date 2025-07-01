@@ -15,13 +15,13 @@ RAW_INDICATORS_PROMPT = ChatPromptTemplate.from_messages(
          "usually uneducated or marginally educated, They usually fall below the poverty line or are classified as low-income. "
          "For each variable, provide an 'id' (a unique string), 'name' (display name), "
          "'var_name' (snake_case for coding, e.g., 'avg_daily_customers'), "
-         "'priority' (integer, 1 being highest, 5 being lowest), 'description', "
-         "'priority_rationale' (explanation for why this priority was assigned), "
+         " 'impact_score' (integer 0-100, higher means more important), 'description', "
+         "'priority_rationale' (explanation for why this impact score was assigned), "
          "'formula' (always null for raw indicators), "
          "'type' (the type of expected input for this variable, e.g., 'text', 'integer', 'float', 'boolean', 'dropdown'), "
          "'value' (always null for raw indicators, this is for user input later), "
          "'project_id' (the unique ID for the current project workflow). "
-         "**Ensure ALL fields in the schema are present and correctly formatted, including 'type', 'priority', 'description', and 'priority_rationale'.**" # Explicit reminder
+         "**Ensure ALL fields in the schema are present and correctly formatted, including 'type', 'priority', 'impact_score', 'description', and 'priority_rationale'.**" # Explicit reminder
          "Generate atleast 15 realistic and useful raw indicators that are relevant to small business income assessment. "
          "\n\n--- Supplementary Context from Historical Data (use to inspire and refine, but prioritize main task and schema adherence) ---\n{context}\n----------------------------------------------------------------------" # Moved to end, clarified role
         ),
@@ -29,7 +29,7 @@ RAW_INDICATORS_PROMPT = ChatPromptTemplate.from_messages(
          "Existing variables to consider for modification or reference: {existing_variables}. "
          "Provide the output in JSON format, strictly following the RawIndicatorsOutput schema. "
          "Ensure 'formula' is always null for raw indicators. "
-         "Ensure 'project_id' is included in each variable object using the provided project ID."
+         "Ensure 'impact_score' (integer 0-100, higher means more important) and 'project_id' are included in each variable object using the provided project ID."
         )
     ]
 )
@@ -42,8 +42,8 @@ DECISION_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
          "decision variables based on raw indicators. These variables "
          "should be directly derivable or calculated from the raw indicators "
          "or other decision variables. "
-         "For each decision variable, provide 'id', 'name', 'var_name', 'priority', "
-         "'description', 'priority_rationale' (explanation for why this priority was assigned), "
+         "For each decision variable, provide 'id', 'name', 'var_name', 'priority', 'impact_score' (integer 0-100, higher means more important), "
+         "'description', 'priority_rationale' (explanation for why this impact score was assigned), "
          "'type' (e.g., 'float'), and a 'formula' (JavaScript string) "
          "that calculates its value based on other 'var_name's. 'value' should be null. "
          "Ensure 'project_id' is included. "
@@ -59,7 +59,7 @@ DECISION_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
          "Ensure all 'formula' values are valid JavaScript expressions that can be evaluated. "
          "Example formula: 'return q_daily_sales * q_num_days_week * 4;' if q_daily_sales is a raw indicator. "
          "Only include variables that are directly calculable from the provided raw indicators. "
-         "Ensure 'project_id' is included in each variable object using the provided project ID."
+         "Ensure 'impact_score' (integer 0-100, higher means more important) and 'project_id' are included in each variable object using the provided project ID."
         )
     ]
 )
