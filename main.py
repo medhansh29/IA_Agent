@@ -24,7 +24,8 @@ from nodes import (
     determine_modification_type,
     _apply_default_variable_properties,
     write_to_supabase,
-    analyze_questionnaire_impact  # Add this import
+    analyze_questionnaire_impact,  # Add this import
+    export_sections_for_card_generator
 )
 
 # Import schemas
@@ -398,7 +399,10 @@ def test_complete_workflow():
         if saved_state.get('error'):
             print(f"❌ Error saving to Supabase: {saved_state['error']}")
         else:
-            print("✅ Successfully saved to Supabase!")
+            # Export section-by-section card generator prompt using LLM
+            card_prompt = export_sections_for_card_generator(saved_state)
+            print("\n=== Card Generator LLM Output (copy and paste into your card generator agent) ===\n")
+            print(card_prompt)
     else:
         print("Skipped saving to Supabase.")
 

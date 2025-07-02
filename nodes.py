@@ -9,6 +9,7 @@ import time # Import for sleep function
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+import openai
 
 # Import prompts from the new prompts.py file
 from prompts import (
@@ -18,7 +19,8 @@ from prompts import (
     DEPENDENCY_ANALYSIS_PROMPT,
     QUESTIONNAIRE_PROMPT,
     JS_REFINEMENT_PROMPT,
-    INTELLIGENT_QUESTIONNAIRE_MODIFICATIONS_PROMPT
+    INTELLIGENT_QUESTIONNAIRE_MODIFICATIONS_PROMPT,
+    EXPORT_SECTION_CARDS_PROMPT
 )
 
 # Import schemas from the new schemas.py file
@@ -1352,3 +1354,39 @@ def fetch_supabase_tables() -> Dict[str, Any]:
             print(f"Error fetching {table} from Supabase: {e}")
             result[table] = []
     return result
+
+def export_sections_for_card_generator(state):
+    questionnaire = state.get("questionnaire")
+    if not questionnaire:
+        prompt = "No questionnaire found in state."
+        state["card_generator_prompt"] = prompt
+        return prompt
+    title = state.get("prompt", "Business Questionnaire")
+    sections = []
+    for section in questionnaire.get("sections", []):
+        section_obj = {
+            "section_title": section.get("title"),
+            "section_order": section.get("order"),
+            "section_description": section.get("description", ""),
+            "core_questions": section.get("core_questions", []),
+            "conditional_questions": section.get("conditional_questions", [])
+        }
+        sections.append(section_obj)
+    sections_json = json.dumps(sections, indent=2)
+    prompt = EXPORT_SECTION_CARDS_PROMPT.format(title=title, sections_json=sections_json)
+    state["card_generator_prompt"] = prompt
+
+    # --- LLM CALL ---
+    openai.api_key = os.getenv("OPENAI_API_KEY")  # Make sure your key is set in env vars
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=2000,
+        temperature=0.3
+    )
+    llm_output = response.choices[0].message.content
+    state["card_generator_llm_output"] = llm_output
+    return llm_output

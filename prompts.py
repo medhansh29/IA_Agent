@@ -87,7 +87,7 @@ INTELLIGENT_VARIABLE_MODIFICATIONS_PROMPT = ChatPromptTemplate.from_messages(
             "\n\n"
             "**IMPORTANT CLARIFICATION:**\n"
             "- When a raw indicator is split or broken down, prefer updating existing decision variables' formulas instead of creating new decision variables.\n"
-            "- When adding a new raw indicator to a decision variable, **always update the existing variable’s formula directly**, do not create a new variable.\n"
+            "- When adding a new raw indicator to a decision variable, **always update the existing variable's formula directly**, do not create a new variable.\n"
             "- Only create new decision variables when explicitly instructed to do so.\n"
             "\n\n"
             "**YOUR TASK:**\n"
@@ -217,8 +217,6 @@ QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
-
-
 # --- Prompt 7: Intelligent Questionnaire Modifications ---
 INTELLIGENT_QUESTIONNAIRE_MODIFICATIONS_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -298,4 +296,46 @@ JS_REFINEMENT_PROMPT = ChatPromptTemplate.from_messages(
          "If '{expression_type}' is a triggering criteria, it should determine when a section or question is displayed."
         )
     ]
+)
+
+# --- Prompt: Export Section Cards for Card Generator ---
+EXPORT_SECTION_CARDS_PROMPT = (
+    "You are a UI/UX assistant. Convert the following questionnaire JSON into a human-readable, section-by-section design specification for a business questionnaire titled '{title}'.\n"
+    "Design requirements:\n"
+    "- Use clear cards or sections, with soft shadows, rounded corners, and ample spacing.\n"
+    "- Each section must be clearly labeled and contain only the questions listed.\n"
+    "- Do NOT hide or conditionally render any fields – all questions should appear regardless of logic or criteria. Avoid nested logic.\n"
+    "- Use a vertical form layout.\n"
+    "- Use visual grouping for each section: include title and description in a distinct card or box at the top of the section.\n"
+    "- Use consistent font size and input spacing.\n"
+    "- Label all inputs clearly.\n"
+    "- Use subtle hover/active states.\n"
+    "- Use Tailwind-style padding, spacing, and light borders.\n"
+    "- The proceed button for each card should be at the bottom of the card.\n"
+    "For each field, specify:\n"
+    "- Field label (from question text)\n"
+    "- Input type (number, text, dropdown, radio, etc.)\n"
+    "- Placeholder (use a user-friendly placeholder based on the question)\n"
+    "- Description (write a short, relevant description for the question)\n"
+    "- Min/Max (if applicable, use sensible values or leave blank)\n"
+    "- Options (if applicable, list all options)\n"
+    "\n"
+    "For each section, output:\n"
+    "Section [number]: [section title]\n"
+    "Display a section card with title: [section title]\n"
+    "Subtitle: [section description]\n"
+    "Add the following fields:\n"
+    "For each question, output:\n"
+    "[question text]\n"
+    "Input type: [type]\n"
+    "Placeholder: [user-friendly placeholder]\n"
+    "Description: [short, relevant description]\n"
+    "Min: [min value], Max: [max value] (if applicable)\n"
+    "Options: [list options] (if applicable)\n"
+    "Do NOT use JSON or code blocks. Output only the filled-in design spec as described above, section by section.\n"
+    "If a value is missing in the JSON, invent a sensible value or leave it blank.\n"
+    "\n"
+    "Here is the questionnaire JSON:\n"
+    "{sections_json}\n"
+    "Format your output exactly as described above, filling in all fields for each question."
 )

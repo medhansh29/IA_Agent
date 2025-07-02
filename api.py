@@ -16,7 +16,8 @@ from nodes import (
     analyze_questionnaire_impact,
     write_to_supabase, # The single function used for multiple save points
     fetch_supabase_tables,
-    analyze_variable_dependencies
+    analyze_variable_dependencies,
+    export_sections_for_card_generator
 )
 
 # Import the GraphState schema
@@ -388,6 +389,16 @@ async def check_status(project_id: str):
     except Exception as e:
         print(f"Error in /api/status: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@api_app.post("/api/export-card-design", summary="Export card design spec using LLM")
+async def export_card_design(request: SharedWorkflowState):
+    """
+    Export the card design spec using the LLM, given the current workflow state.
+    """
+    state = request.model_dump()
+    card_design = export_sections_for_card_generator(state)
+    return {"card_design": card_design}
 
 
 if __name__ == "__main__":
