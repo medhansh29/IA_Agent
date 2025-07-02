@@ -17,7 +17,6 @@ from prompts import (
     INTELLIGENT_VARIABLE_MODIFICATIONS_PROMPT,
     DEPENDENCY_ANALYSIS_PROMPT,
     QUESTIONNAIRE_PROMPT,
-    QUESTIONNAIRE_MODIFICATIONS_PROMPT,
     JS_REFINEMENT_PROMPT,
     INTELLIGENT_QUESTIONNAIRE_MODIFICATIONS_PROMPT
 )
@@ -1111,10 +1110,10 @@ def write_to_supabase(state: GraphState) -> GraphState:
                         "section_name": section["title"],
                         "section_description": section["description"],
                         "is_mandatory": is_q_mandatory_in_db, # Updated as per user's clarification
-                        "section_triggering_criteria": section["triggering_criteria"],
+                        "section_triggering_criteria": section.get("triggering_criteria"),
                         "question_var_name": question["variable_name"],
                         "impacted_raw_indicators": json.dumps(impacted_ri_details), # Store as JSON string for jsonb field
-                        "question_triggering_criteria": question["triggering_criteria"],
+                        "question_triggering_criteria": question.get("triggering_criteria"),
                         "is_conditional": question.get("is_conditional", False), # New: Add is_conditional field
                         "formula": question.get("formula") # Include the new formula field
                     }

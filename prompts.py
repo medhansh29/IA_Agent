@@ -24,6 +24,9 @@ RAW_INDICATORS_PROMPT = ChatPromptTemplate.from_messages(
          "**Ensure ALL fields in the schema are present and correctly formatted, including 'type', 'priority', 'impact_score', 'description', and 'priority_rationale'.**" # Explicit reminder
          "Generate atleast 15 realistic and useful raw indicators that are relevant to small business income assessment. "
          "\n\n--- Supplementary Context from Historical Data (use to inspire and refine, but prioritize main task and schema adherence) ---\n{context}\n----------------------------------------------------------------------" # Moved to end, clarified role
+         "Important note: The prompt given by the user might contain important information about the business context. Use it to generate raw indicators that are relevant to the business context. "
+         "For example: If the user says 'The business is a small grocery store with 4 employees and earnings of Rs 6000 per month', generate raw indicators that are relevant to a grocery store keeping in mind its properties "
+         "Remember the location of the business is in India, so use Indian currency and units: Rupees, Kilometers, etc. "
         ),
         ("human", "Based on the following user input and any existing variables, generate a list of raw indicators: {user_input}. "
          "Existing variables to consider for modification or reference: {existing_variables}. "
@@ -50,6 +53,9 @@ DECISION_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
          "**Generate meaningful and accurate JavaScript formulas which tell how the decision variables are to be computed from the raw indicators, strictly adhering to the schema.**" # Explicit reminder
          "**IMPORTANT**: For each decision variable, include a detailed rationale in the 'priority_rationale' field explaining why this variable is important for income assessment and decision-making.**" # New requirement
          "genrate atleast 10 decision variables that are relevant to small business income assessment. "
+         "Important note: The prompt given by the user might contain important information about the business context. Use it to generate decision variables that are relevant to the business context. "
+         "For example: If the user says 'The business is a small grocery store with 4 employees and earnings of Rs 6000 per month', generate decision variablesthat are relevant to a grocery store keeping in mind its properties "
+         "Remember the location of the business is in India, so use Indian currency and units: Rupees, Kilometers, etc. "
          "\n\n--- Supplementary Context from Historical Data (use to inspire and refine, but prioritize main task and schema adherence) ---\n{context}\n----------------------------------------------------------------------" # Moved to end, clarified role
         ),
         ("human", "Given the following raw indicators:\n{raw_indicators}\n\n"
@@ -106,8 +112,12 @@ INTELLIGENT_VARIABLE_MODIFICATIONS_PROMPT = ChatPromptTemplate.from_messages(
          "- If a raw indicator is removed, either remove dependent decision variables or suggest alternatives\n"
          "- If a raw indicator name changes, update all referencing formulas\n"
          "- If new raw indicators are added, suggest relevant decision variables\n"
+         "- If a decison variable is removed, either remove dependent raw indicators if those raw indicators are not used by any other decision variable, or suggest alternatives\n"
+         "- If a decision variable name changes, update all referencing formulas\n"
+         "- If new decision variables are added, suggest relevant raw indictaors or use existing ones\n"
          "- Ensure all decision variable formulas reference valid raw indicators\n"
          "- Consider the business context when making decisions about what to keep or remove"
+         "- Make sure that each decision varaible is calculated from atleast one raw indicator. There should not be any raw indicator that is not used by any decision variable"
         ),
         ("human", "Please analyze the modification request and provide comprehensive changes that maintain system consistency. "
          "Focus on understanding the dependencies and ensuring the final state makes business sense for income assessment."
@@ -161,7 +171,6 @@ QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
          "- 'is_mandatory': boolean, mostly always true. Can be false if the section is optional(once or two sections maximum)"
          "  - If false, section needs 'triggering_criteria' (a description of the criteria that must be met for the section to be displayed) IMPORTANT: it must be there if the section is optional"
          "- Each section must have both core_questions and conditional_questions lists\n"
-         "generate atleast 4-7 sections which are relevant to the business context"
          "\n\n"
          "**QUESTION PROPERTIES:**\n"
          "For each `Question`, provide:\n"
@@ -181,12 +190,27 @@ QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
          "   - Optional sections (is_mandatory=false) need section-level triggering_criteria\n"
          "   - Conditional questions (is_conditional=true) need question-level question_triggering_criteria\n"
          "   - These are independent: you can have conditional questions in mandatory sections\n"
+         "   - You can have optional sections with no conditional questions\n"
          "2. More than one question can map to one raw indicator for granularity\n"
          "   Example: Monthly expenses -> separate questions for rent, utilities, supplies\n"
-         "3. Include at least one optional section (is_mandatory=false)\n"
-         "4. Include some conditional questions (is_conditional=true) in each section\n"
+
+         "3. Include one optional section (is_mandatory=false)\n"
+         "4. Include at most one conditional question (is_conditional=true) in each section\n"
          "5. Ensure all formulas and triggering criteria are valid JS\n"
+         "6. Make sure that each question is relevant to the business context and is not too broad or complex"
+         "7. Make sure that the each raw indicator is covered by atleast one question"
+         "8. generate 25-50 questions, with atleast 4-7 sections"
+         "9. Important note: The prompt given by the user might contain important information about the business context. Use it to generate questions that are relevant to the business context. "
+         "   - For example: If the user says 'The business is a small grocery store with 4 employees and earnings of Rs 6000 per month', generate decision variablesthat are relevant to a grocery store keeping in mind its properties "
+         "10. Remember the location of the business is in India, so use Indian currency and units: Rupees, Kilometers, etc. "
          "\n\n"
+         "---Reminders---"
+         "Every optional section must have a triggering criteria"
+         "Every conditional question must have a question triggering criteria"
+         "You can not have a conditional question or a optional section without a triggering criteria"
+         "Every question must be relevant to the business context and is not too broad or complex"
+         "Every raw indicator must be covered by atleast one question"
+         "Generate 25-50 questions, with atleast 4-7 sections"
          "--- Supplementary Context from Historical Data ---\n"
          "{context}\n"
          "----------------------------------------------------------------------"
@@ -202,31 +226,7 @@ QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
-# --- Prompt 6: Questionnaire Modifications (RAG context removed) ---
-QUESTIONNAIRE_MODIFICATIONS_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system",
-         "You are an AI assistant tasked with modifying a JSON representation of a questionnaire. "
-         "Based on the 'modification_request', you need to identify which sections/questions to add, update, or remove. "
-         "For updates on sections, specify the 'order' of the section and the fields to change in the 'updates' dictionary. "
-         "For updates on questions, specify the 'id' of the question and the fields to change in the 'updates' dictionary. "
-         "For removals, specify the 'order' for sections or 'variable_name' for questions. "
-         "For additions, create new sections/questions following their respective schemas, ensuring 'id' is a new UUID for questions. "
-         "For added questions, specify `section_order` and `is_core` to indicate whether it belongs to `core_questions` or `conditional_questions`. "
-         "Your output must strictly follow the QuestionnaireModificationsOutput schema. "
-         "Ensure 'project_id' is preserved for updated/removed entities and set for new ones. "
-         "If the modification request asks to make a question more granular, break it into multiple simpler, more focused questions that together cover the same variable(s). "
-         "Always provide at least one concrete modification if the prompt requests more detail, granularity, or similar questions. "
-         "If a question is too broad or complex, suggest splitting it into smaller questions. "
-         "If the modification request is ambiguous, err on the side of making the questionnaire more detailed and actionable. "
-         "Strictly follow the QuestionnaireModificationsOutput schema."
-        ),
-        ("human", "Based on this modification request: '{modification_request}', "
-         "and the current questionnaire structure:\n{current_questionnaire}\n\n"
-         "Generate the necessary modifications. If no changes are needed, return empty lists/dictionaries for all modification types."
-        )
-    ]
-)
+
 
 # --- Prompt 7: Intelligent Questionnaire Modifications ---
 INTELLIGENT_QUESTIONNAIRE_MODIFICATIONS_PROMPT = ChatPromptTemplate.from_messages(
