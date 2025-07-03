@@ -10,6 +10,7 @@ class VariableSchema(TypedDict):
     description: str
     priority_rationale: str  # New field: explanation for why this priority was assigned
     formula: Optional[str] # Null for raw indicators, JS string for decision variables
+    function: Optional[str] # New: Human-readable formula for UI display
     type: str # New field: text, int, float, dropdown, etc.
     value: Optional[str] # New field: initially null, for user input later
     project_id: Optional[str] # New: Added for project differentiation
@@ -77,6 +78,7 @@ class Question(TypedDict):
     triggering_criteria: Optional[str] # JS function string, e.g., "return question_variable_name_from_prev_q === 'Yes';"
     raw_indicators: List[str] # List of var_name of raw indicators this question helps capture
     formula: Optional[str] # JS function string, e.g., "return parseFloat(q_daily_sales);"
+    function: Optional[str] # New: Human-readable formula for UI display
     is_conditional: Optional[bool] # New: Indicates if the question is conditional
     project_id: Optional[str] # New: Added for project differentiation
 
@@ -147,6 +149,7 @@ class GraphState(TypedDict):
         modification_reasoning: Optional[str] # New: Stores LLM reasoning for modifications
         status: Optional[str] # New: Tracks the current status of the workflow
         needs_review: Optional[bool] # New: Indicates if modifications need review
+        questionnaire_title: Optional[str] # New: Stores the generated questionnaire title
     """
     prompt: str
     modification_prompt: Optional[str]
@@ -160,6 +163,7 @@ class GraphState(TypedDict):
     modification_reasoning: Optional[str]
     status: Optional[str]
     needs_review: Optional[bool]
+    questionnaire_title: Optional[str]
 
 # For Remediation Output (used by analyze_questionnaire_impact)
 class RemediationOutput(TypedDict):
