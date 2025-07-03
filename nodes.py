@@ -1346,7 +1346,7 @@ def fetch_supabase_tables() -> Dict[str, Any]:
     }
     base_url = SUPABASE_URL
     result = {}
-    for table in ["raw_indicators", "decision_variables", "questions"]:
+    for table in ["raw_indicators", "decision_variables", "questions", "prompts"]:
         url = f"{base_url}/{table}?select=*"
         try:
             resp = requests.get(url, headers=headers)
