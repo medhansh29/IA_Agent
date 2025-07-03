@@ -51,17 +51,25 @@ load_dotenv()  # Load environment variables from .env file
 SUPABASE_URL = "https://kvzvonrozcmpiflnzcjy.supabase.co/rest/v1"
 SUPABASE_API_KEY = os.getenv("SUPABASE_CLIENT_ANON_KEY", "YOUR_SUPABASE_CLIENT_ANON_KEY")
 
-
 # Initialize the Language Model
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+llm_modification = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
 
-# Initialize RAG components once at module level
-try:
-    rag_chain, retriever = get_rag_chain_and_retriever()
-except Exception as e:
-    print(f"Warning: Could not initialize RAG components: {e}")
-    rag_chain = None
-    retriever = None
+# --- LAZY RAG LOADING ---
+_rag_cache = {"rag_chain": None, "retriever": None, "init": False}
+def get_lazy_rag_components():
+    if not _rag_cache["init"]:
+        try:
+            rag_chain, retriever = get_rag_chain_and_retriever()
+            _rag_cache["rag_chain"] = rag_chain
+            _rag_cache["retriever"] = retriever
+            _rag_cache["init"] = True
+        except Exception as e:
+            print(f"Warning: Could not initialize RAG components: {e}")
+            _rag_cache["rag_chain"] = None
+            _rag_cache["retriever"] = None
+            _rag_cache["init"] = True
+    return _rag_cache["rag_chain"], _rag_cache["retriever"]
 
 # Helper for refining JS expressions with retry mechanism
 def _refine_js_expression(llm_instance: ChatOpenAI, expression_type: str, current_expression: Optional[str],
@@ -251,6 +259,7 @@ def generate_variables(state: GraphState) -> GraphState:
 
     # Get RAG context
     context_docs = []
+    _rag_chain, retriever = get_lazy_rag_components()
     if retriever:
         try:
             print(f"Retrieving RAG context for prompt: {prompt_text}")
@@ -292,6 +301,7 @@ def generate_variables(state: GraphState) -> GraphState:
 
         # Use RAG context for decision variables based on raw indicator names
         decision_context_docs = []
+        _rag_chain, retriever = get_lazy_rag_components()
         if retriever:
             try:
                 print(f"Retrieving RAG context for decision variables based on: {raw_indicator_names}")
@@ -363,7 +373,7 @@ def modify_variables_intelligent(state: GraphState) -> GraphState:
         }
         
         # Use the intelligent modification prompt
-        intelligent_chain = INTELLIGENT_VARIABLE_MODIFICATIONS_PROMPT | llm.with_structured_output(
+        intelligent_chain = INTELLIGENT_VARIABLE_MODIFICATIONS_PROMPT | llm_modification.with_structured_output(
             IntelligentVariableModificationsOutput, method='function_calling'
         )
         
@@ -478,12 +488,16 @@ def apply_intelligent_modifications(state: GraphState, llm_response: Dict, proje
     
     # Handle formula updates
     updated_formulas = llm_response.get("updated_formulas", {})
+    updated_dv_raw_inds = llm_response.get("updated_decision_variable_raw_indicators", {})
     # print(f"[DEBUG] Updated formulas: {updated_formulas}")
     for var_name, new_formula in updated_formulas.items():
         # Update decision variable formula
         for dv in decision_variables:
             if dv.get('var_name') == var_name:
                 dv['formula'] = new_formula
+                # Also update raw_indicators array if present
+                if var_name in updated_dv_raw_inds:
+                    dv['raw_indicators'] = updated_dv_raw_inds[var_name]
                 break
     
     # Update state
@@ -549,6 +563,7 @@ def generate_questionnaire(state: GraphState) -> GraphState:
     decision_vars_json = json.dumps(decision_vars_info, indent=2)
 
     context_docs = []
+    _rag_chain, retriever = get_lazy_rag_components()
     if retriever:
         try:
             print(f"Retrieving RAG context for questionnaire generation based on: {prompt_context}")

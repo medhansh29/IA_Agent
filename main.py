@@ -3,6 +3,7 @@ import json
 import uuid
 from typing import Dict, Any, Optional, List, cast
 from dotenv import load_dotenv
+import psutil
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
@@ -38,6 +39,11 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
 # Initialize checkpoint memory
 memory = MemorySaver()
+
+def print_memory_usage(note=""):
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / 1024 / 1024
+    print(f"[MEMORY] {note} RSS: {mem_mb:.2f} MB")
 
 def create_workflow() -> StateGraph:
     """
@@ -321,11 +327,14 @@ def test_complete_workflow():
         "modification_reasoning": None
     }
 
+    print_memory_usage("Before any workflow step")
     # Step 1: Generate variables
     state = generate_variables(cast(GraphState, state))
+    print_memory_usage("After variable generation (RAG may be triggered here)")
 
     # Step 2: Analyze dependencies
     state = analyze_variable_dependencies_node(cast(GraphState, state))
+    print_memory_usage("After dependency analysis")
 
     # Step 3: Iterative variable modification loop
     while True:
@@ -339,15 +348,19 @@ def test_complete_workflow():
             state["modification_prompt"] = mod_prompt
             # Run modification node
             state = modify_variables_intelligent(cast(GraphState, state))
+            print_memory_usage("After variable modification")
             # Clear the modification prompt to avoid infinite loop
             state["modification_prompt"] = None
             # Re-analyze dependencies after modification
             state = analyze_variable_dependencies_node(cast(GraphState, state))
+            print_memory_usage("After dependency analysis (post-modification)")
         elif user_action == 'f':
             proceed = input("Proceed to questions? (y/n): ").strip().lower()
             if proceed == 'y':
                 # Generate questionnaire
+                print_memory_usage("Before questionnaire generation")
                 state = generate_questionnaire(cast(GraphState, state))
+                print_memory_usage("After questionnaire generation (RAG may be triggered here)")
                 print("\n=== Generated Questionnaire ===")
                 print(json.dumps(state.get("questionnaire"), indent=2, default=str))
                 break
