@@ -569,15 +569,15 @@ def generate_questionnaire(state: GraphState) -> GraphState:
         })
         generated_questionnaire = llm_response
 
+        
+
         # Generate a title for the questionnaire
-        title = None
-        if "title" in generated_questionnaire and generated_questionnaire["title"]:
-            title = generated_questionnaire["title"]
-        elif generated_questionnaire.get("sections") and generated_questionnaire["sections"][0].get("title"):
-            title = generated_questionnaire["sections"][0]["title"]
-        else:
-            # Fallback: use a short version of the prompt
-            title = prompt_text[:60] + ("..." if len(prompt_text) > 60 else "")
+        title = generated_questionnaire.get("title")
+        if not title or not title.strip():
+            # Fallback: use the first 3 words of the prompt, title-cased, with '...' at the end
+            words = prompt_text.strip().split()
+            title = " ".join(words[:6]).title() + "..."
+        print(f"[DEBUG] Extracted questionnaire title: '{title}'")  # DEBUG PRINT
         state["questionnaire_title"] = title
 
         # Collect initial q_vars from generated_questionnaire to populate all_existing_q_vars_set
@@ -1121,6 +1121,7 @@ def write_to_supabase(state: GraphState) -> GraphState:
 
     # --- Write Prompt, Title, and Project ID to 'prompts' table ---
     prompt_entry = {
+        "id": state.get("project_id"),  # Use project_id as the unique id
         "project_id": state.get("project_id"),
         "prompt": state.get("prompt"),
         "title": state.get("questionnaire_title", "")

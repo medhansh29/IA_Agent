@@ -305,6 +305,8 @@ def test_complete_workflow():
     print("\n=== TESTING COMPLETE WORKFLOW (Strict User Flow) ===")
     prompt = input("Enter your assessment prompt (e.g., 'Assess income for a street food vendor'): ").strip()
     project_id = input("Enter project ID (optional, press Enter for auto-generated): ").strip() or None
+    if not project_id:
+        project_id = str(uuid.uuid4())
 
     # Initial workflow state
     state = {
