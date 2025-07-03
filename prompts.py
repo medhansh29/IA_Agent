@@ -18,10 +18,11 @@ RAW_INDICATORS_PROMPT = ChatPromptTemplate.from_messages(
          " 'impact_score' (integer 0-100, higher means more important), 'description', "
          "'priority_rationale' (explanation for why this impact score was assigned), "
          "'formula' (always null for raw indicators), "
+         "'function' (a human-readable assignment or math-like expression for UI display, e.g., 'monthly_revenue = answer'), "
          "'type' (the type of expected input for this variable, e.g., 'text', 'integer', 'float', 'boolean', 'dropdown'), "
          "'value' (always null for raw indicators, this is for user input later), "
          "'project_id' (the unique ID for the current project workflow). "
-         "**Ensure ALL fields in the schema are present and correctly formatted, including 'type', 'priority', 'impact_score', 'description', and 'priority_rationale'.**" # Explicit reminder
+         "**Ensure ALL fields in the schema are present and correctly formatted, including 'type', 'priority', 'impact_score', 'description', 'priority_rationale', and 'function'.**" # Explicit reminder
          "Generate atleast 15 realistic and useful raw indicators that are relevant to small business income assessment. "
          "\n\n--- Supplementary Context from Historical Data (use to inspire and refine, but prioritize main task and schema adherence) ---\n{context}\n----------------------------------------------------------------------" # Moved to end, clarified role
          "Important note: The prompt given by the user might contain important information about the business context. Use it to generate raw indicators that are relevant to the business context. "
@@ -32,6 +33,7 @@ RAW_INDICATORS_PROMPT = ChatPromptTemplate.from_messages(
          "Existing variables to consider for modification or reference: {existing_variables}. "
          "Provide the output in JSON format, strictly following the RawIndicatorsOutput schema. "
          "Ensure 'formula' is always null for raw indicators. "
+         "Ensure 'function' is a human-readable assignment or math-like expression for UI display. "
          "Ensure 'impact_score' (integer 0-100, higher means more important) and 'project_id' are included in each variable object using the provided project ID."
         )
     ]
@@ -49,8 +51,10 @@ DECISION_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
          "'description', 'priority_rationale' (explanation for why this impact score was assigned), "
          "'type' (e.g., 'float'), and a 'formula' (JavaScript string) "
          "that calculates its value based on other 'var_name's. 'value' should be null. "
+         "'function' (a human-readable assignment or math-like expression for UI display, e.g., 'weekly_revenue = daily_sales * operating_days'), "
          "Ensure 'project_id' is included. "
          "**Generate meaningful and accurate JavaScript formulas which tell how the decision variables are to be computed from the raw indicators, strictly adhering to the schema.**" # Explicit reminder
+         "**Also generate a 'function' field for each variable, which is a human-readable assignment or math-like expression for UI display.**" # New requirement
          "**IMPORTANT**: For each decision variable, include a detailed rationale in the 'priority_rationale' field explaining why this variable is important for income assessment and decision-making.**" # New requirement
          "genrate atleast 10 decision variables that are relevant to small business income assessment. "
          "Important note: The prompt given by the user might contain important information about the business context. Use it to generate decision variables that are relevant to the business context. "
@@ -63,7 +67,9 @@ DECISION_VARIABLES_PROMPT = ChatPromptTemplate.from_messages(
          "Based on the user's initial input: '{user_input}', generate relevant decision variables. "
          "Strictly provide the output in JSON format, following the DecisionVariablesOutput schema. "
          "Ensure all 'formula' values are valid JavaScript expressions that can be evaluated. "
+         "Ensure 'function' is a human-readable assignment or math-like expression for UI display. "
          "Example formula: 'return q_daily_sales * q_num_days_week * 4;' if q_daily_sales is a raw indicator. "
+         "Example function: 'weekly_revenue = daily_sales * operating_days' for UI display. "
          "Only include variables that are directly calculable from the provided raw indicators. "
          "Ensure 'impact_score' (integer 0-100, higher means more important) and 'project_id' are included in each variable object using the provided project ID."
         )
@@ -155,8 +161,13 @@ QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
         ("system",
          "You are an AI assistant that designs comprehensive and logical questionnaires "
          "for small business financial assessment. Your task is to generate a questionnaire "
-         "structure, organized into sections. Each `Section` must explicitly contain two lists of questions: "
+         "structure, organized into sections, and also generate a clear, concise, and relevant 'title' for the questionnaire. "
+         "The 'title' should summarize the business context and purpose of the questionnaire, and must be included as a top-level field in the output JSON. "
+         "Each `Section` must explicitly contain two lists of questions: "
          "`core_questions` and `conditional_questions`. "
+         "\n\n"
+         "**QUESTIONNAIRE TITLE:**\n"
+         "- 'title': A short, descriptive title for the questionnaire, e.g., 'Tailor Shop Income Assessment' or 'Grocery Store Financial Assessment'.\n"
          "\n\n"
          "**SECTION PROPERTIES:**\n"
          "- 'is_mandatory': boolean, mostly always true. Can be false if the section is optional(once or two sections maximum)"
@@ -171,6 +182,7 @@ QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
          "- 'variable_name': snake_case name\n"
          "- 'raw_indicators': list of var_names this question helps capture\n"
          "- 'formula': JS function showing how to map the answer to raw indicators\n"
+         "- 'function': a human-readable assignment or math-like expression for UI display, e.g., 'monthly_expense = answer'\n"
          "- 'is_conditional': boolean, mostly always false. Can be true if the question is conditional on the answer to a previous question"
          "  - If true, question needs 'question_triggering_criteria' (a description of what trigegrs the question)\n"
          "  - If false, question has no triggering criteria (null)\n"
@@ -184,7 +196,6 @@ QUESTIONNAIRE_PROMPT = ChatPromptTemplate.from_messages(
          "   - You can have optional sections with no conditional questions\n"
          "2. More than one question can map to one raw indicator for granularity\n"
          "   Example: Monthly expenses -> separate questions for rent, utilities, supplies\n"
-
          "3. Include one optional section (is_mandatory=false)\n"
          "4. Include at most one conditional question (is_conditional=true) in each section\n"
          "5. Ensure all formulas and triggering criteria are valid JS\n"

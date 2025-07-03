@@ -61,6 +61,7 @@ class SharedWorkflowState(BaseModel):
     modification_reasoning: Optional[str] = None # New: Stores LLM reasoning for modifications
     status: Optional[str] = None  # New: Track workflow status
     needs_review: Optional[bool] = None  # New: Indicates if modifications need review
+    questionnaire_title: Optional[str] = None  # New: Title of the generated questionnaire
 
 
 class ModificationRequest(BaseModel):
@@ -346,27 +347,36 @@ def fetch_supabase_tables_api():
 
 @api_app.get("/api/fetch-assessment/{project_id}", response_model=SharedWorkflowState)
 async def fetch_assessment(project_id: str):
-    """Fetch a specific assessment by project_id"""
+    """Fetch a specific assessment by project_id, including prompt and title from the prompts table."""
     try:
         tables = fetch_supabase_tables()
-        # Find the assessment with matching project_id
-        for assessment in tables:
-            if isinstance(assessment, dict) and assessment.get("project_id") == project_id:
-                # Convert the assessment to a proper SharedWorkflowState
-                state = SharedWorkflowState(
-                    prompt=assessment.get("prompt", ""),
-                    project_id=project_id,
-                    raw_indicators=assessment.get("raw_indicators"),
-                    decision_variables=assessment.get("decision_variables"),
-                    questionnaire=assessment.get("questionnaire"),
-                    status=assessment.get("status", "unknown"),
-                    modification_history=assessment.get("modification_history", []),
-                    dependency_graph=assessment.get("dependency_graph"),
-                    modification_reasoning=assessment.get("modification_reasoning"),
-                    needs_review=False  # Saved assessments don't need review
-                )
-                return state
-        raise HTTPException(status_code=404, detail=f"Assessment with project_id {project_id} not found")
+        # Find the prompt and title from the prompts table
+        prompt_entry = None
+        for entry in tables.get("prompts", []):
+            if isinstance(entry, dict) and entry.get("project_id") == project_id:
+                prompt_entry = entry
+                break
+        # Find the assessment data from the other tables
+        raw_indicators = [ri for ri in tables.get("raw_indicators", []) if ri.get("project_id") == project_id]
+        decision_variables = [dv for dv in tables.get("decision_variables", []) if dv.get("project_id") == project_id]
+        questions = [q for q in tables.get("questions", []) if q.get("project_id") == project_id]
+        # Attempt to reconstruct questionnaire from questions (if needed)
+        questionnaire = None # You may want to implement logic to reconstruct this if needed
+        # Compose the state
+        state = SharedWorkflowState(
+            prompt=prompt_entry.get("prompt", "") if prompt_entry else "",
+            project_id=project_id,
+            questionnaire_title=prompt_entry.get("title", "") if prompt_entry else "",
+            raw_indicators=raw_indicators,
+            decision_variables=decision_variables,
+            questionnaire=questionnaire,
+            status="unknown",
+            modification_history=[],
+            dependency_graph=None,
+            modification_reasoning=None,
+            needs_review=False
+        )
+        return state
     except Exception as e:
         print(f"Error in /api/fetch-assessment: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

@@ -508,13 +508,13 @@ def apply_intelligent_modifications(state: GraphState, llm_response: Dict, proje
 def generate_questionnaire(state: GraphState) -> GraphState:
     """
     Generates a questionnaire based on the raw indicators and decision variables.
+    Also generates a title for the questionnaire and stores it in state['questionnaire_title'].
     """
     print("\n---GENERATING QUESTIONNAIRE---")
-    # Ensure state["error"] is a string at the start of this node
     state["error"] = state.get("error", "")
 
     prompt_text = state["prompt"]
-    project_id = state.get("project_id") # Get project_id from state
+    project_id = state.get("project_id")
     raw_indicators = state.get("raw_indicators", [])
     decision_variables = state.get("decision_variables")
 
@@ -526,7 +526,6 @@ def generate_questionnaire(state: GraphState) -> GraphState:
         print("No raw indicators available for questionnaire generation.")
         return state
 
-    # Create context for questionnaire generation
     prompt_context = f"User request: {prompt_text}. Generate a questionnaire to assess income for small business owners."
 
     raw_indicators_info = [
@@ -549,7 +548,6 @@ def generate_questionnaire(state: GraphState) -> GraphState:
     ]
     decision_vars_json = json.dumps(decision_vars_info, indent=2)
 
-    # Get RAG context for questionnaire generation
     context_docs = []
     if retriever:
         try:
@@ -567,12 +565,22 @@ def generate_questionnaire(state: GraphState) -> GraphState:
             "user_input": prompt_context,
             "raw_indicators": raw_indicators_json,
             "decision_variables": decision_vars_json,
-            "context": context_docs # Pass RAG context
+            "context": context_docs
         })
         generated_questionnaire = llm_response
 
+        # Generate a title for the questionnaire
+        title = None
+        if "title" in generated_questionnaire and generated_questionnaire["title"]:
+            title = generated_questionnaire["title"]
+        elif generated_questionnaire.get("sections") and generated_questionnaire["sections"][0].get("title"):
+            title = generated_questionnaire["sections"][0]["title"]
+        else:
+            # Fallback: use a short version of the prompt
+            title = prompt_text[:60] + ("..." if len(prompt_text) > 60 else "")
+        state["questionnaire_title"] = title
+
         # Collect initial q_vars from generated_questionnaire to populate all_existing_q_vars_set
-        # Use a set to ensure uniqueness from the start
         all_existing_q_vars_set = set()
         for section in generated_questionnaire.get("sections", []):
             for q_list in [section.get('core_questions', []), section.get('conditional_questions', [])]:
@@ -580,26 +588,22 @@ def generate_questionnaire(state: GraphState) -> GraphState:
                     if question.get('variable_name'):
                         all_existing_q_vars_set.add(question['variable_name'])
 
-        # Post-processing: Ensure IDs, default values, and intelligent JS for sections and questions
         for sec_idx, section in enumerate(generated_questionnaire.get("sections", [])):
-            section['order'] = section.get('order', sec_idx + 1) # Ensure order
-            # Pass the main state dict directly for error tracking
-            _process_section_properties(section, all_existing_q_vars_set, state, project_id=project_id) # Pass project_id
-
+            section['order'] = section.get('order', sec_idx + 1)
+            _process_section_properties(section, all_existing_q_vars_set, state, project_id=project_id)
             for q_list, is_core_q_flag in [
                 (section['core_questions'], True),
                 (section['conditional_questions'], False)
             ]:
                 for q_idx, question in enumerate(q_list):
-                    # Pass the main state dict directly for error tracking
-                    _process_question_properties(question, is_core_q_flag, all_existing_q_vars_set, state, project_id=project_id) # Pass project_id
+                    _process_question_properties(question, is_core_q_flag, all_existing_q_vars_set, state, project_id=project_id)
 
         state["questionnaire"] = generated_questionnaire
         print("\n---Generated Questionnaire:---")
         print(json.dumps(generated_questionnaire, indent=2))
 
     except Exception as e:
-        state["error"] = (state.get("error") or "") + f"Error generating questionnaire: {e}" # Concatenate
+        state["error"] = (state.get("error") or "") + f"Error generating questionnaire: {e}"
         print(f"Error generating questionnaire: {e}")
 
     return state
@@ -1034,9 +1038,9 @@ def write_to_supabase(state: GraphState) -> GraphState:
     Writes the generated (and potentially LLM-modified) raw indicators and decision variables
     and questionnaire questions to your Supabase tables. This function now performs
     upsert operations (update if exists, insert if new) for individual records.
+    Also saves the prompt, title, and project_id to the 'prompts' table.
     """
     print("\n---WRITING TO SUPABASE---")
-    # Ensure state["error"] is a string at the start of this node
     state["error"] = state.get("error", "")
 
     headers = {
@@ -1051,10 +1055,7 @@ def write_to_supabase(state: GraphState) -> GraphState:
     if raw_indicators_to_write:
         print(f"Attempting to upsert {len(raw_indicators_to_write)} raw indicators...")
         for var in raw_indicators_to_write:
-            # The 'id' in 'var' is already project-prefixed due to _apply_default_variable_properties
-            # Ensure project_id is correctly set in the item payload
             var["project_id"] = state.get("project_id")
-            # Using 'raw_indicators' as the table name
             if not _upsert_single_item("raw_indicators", var, headers): 
                 error_occurred = True
     else:
@@ -1065,7 +1066,6 @@ def write_to_supabase(state: GraphState) -> GraphState:
     if decision_vars_to_write:
         print(f"Attempting to upsert {len(decision_vars_to_write)} decision variables...")
         for var in decision_vars_to_write:
-            # The 'id' in 'var' is already project-prefixed
             var["project_id"] = state.get("project_id")
             if not _upsert_single_item("decision_variables", var, headers):
                 error_occurred = True
@@ -1074,59 +1074,60 @@ def write_to_supabase(state: GraphState) -> GraphState:
 
     # --- Write Questionnaire Questions to 'questions' table ---
     questionnaire_data = state.get("questionnaire")
-    # For mapping RIs to ID/Name, ensure we use the project-prefixed IDs from the current state
     raw_indicators_map = {ri['var_name']: ri for ri in (state.get("raw_indicators") or [])}
 
     questions_to_supabase = []
     if questionnaire_data and questionnaire_data.get("sections"):
         for section in questionnaire_data["sections"]:
-            # Process core questions
             for q_type_list, is_core_q_flag in [
                 (section.get('core_questions', []), True),
                 (section.get('conditional_questions', []), False)
             ]:
                 for question in q_type_list:
-                    # The is_mandatory field for the question in Supabase should reflect the section's mandatory status.
-                    # Individual question's conditional logic is handled by question_triggering_criteria.
                     is_q_mandatory_in_db = section.get('is_mandatory', False)
-
                     impacted_ri_details = []
-                    # The `ri_var_name` here is the *base* variable name (e.g., 'avg_monthly_income') from the question's raw_indicators list.
-                    # We need to find the corresponding raw indicator object in our `state["raw_indicators"]` which now has project-prefixed IDs.
-                    # The `raw_indicators_map` already helps us find the full RI object by its `var_name`.
                     for ri_var_name in question.get('raw_indicators', []):
                         ri_detail = raw_indicators_map.get(ri_var_name)
                         if ri_detail:
                             impacted_ri_details.append({
-                                "id": ri_detail["id"], # This will now be the project-prefixed ID
+                                "id": ri_detail["id"],
                                 "name": ri_detail["name"]
                             })
                         else:
                             print(f"Warning: Raw indicator '{ri_var_name}' not found for question '{question.get('variable_name')}' during Supabase write.")
 
                     question_entry = {
-                        "id": question["id"], # This is already project-prefixed
-                        "project_id": state.get("project_id"), # Add project_id
+                        "id": question["id"],
+                        "project_id": state.get("project_id"),
                         "section_number": section["order"],
                         "question_name": question["text"],
                         "section_name": section["title"],
                         "section_description": section["description"],
-                        "is_mandatory": is_q_mandatory_in_db, # Updated as per user's clarification
+                        "is_mandatory": is_q_mandatory_in_db,
                         "section_triggering_criteria": section.get("triggering_criteria"),
                         "question_var_name": question["variable_name"],
-                        "impacted_raw_indicators": json.dumps(impacted_ri_details), # Store as JSON string for jsonb field
+                        "impacted_raw_indicators": json.dumps(impacted_ri_details),
                         "question_triggering_criteria": question.get("triggering_criteria"),
-                        "is_conditional": question.get("is_conditional", False), # New: Add is_conditional field
-                        "formula": question.get("formula") # Include the new formula field
+                        "is_conditional": question.get("is_conditional", False),
+                        "formula": question.get("formula")
                     }
                     questions_to_supabase.append(question_entry)
-        
         print(f"Attempting to upsert {len(questions_to_supabase)} questions...")
         for q_entry in questions_to_supabase:
             if not _upsert_single_item("questions", q_entry, headers):
                 error_occurred = True
     else:
         print("No questionnaire sections found in state to write to Supabase 'questions' table.")
+
+    # --- Write Prompt, Title, and Project ID to 'prompts' table ---
+    prompt_entry = {
+        "project_id": state.get("project_id"),
+        "prompt": state.get("prompt"),
+        "title": state.get("questionnaire_title", "")
+    }
+    print(f"Upserting prompt entry to 'prompts' table: {prompt_entry}")
+    if not _upsert_single_item("prompts", prompt_entry, headers):
+        error_occurred = True
 
     if error_occurred:
         pass
